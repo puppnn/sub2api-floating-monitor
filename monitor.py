@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 import threading
 import time
@@ -26,6 +27,7 @@ REFRESH_SECONDS = 3
 CLIENT_USAGE_EXPORT = Path(os.environ.get("CLIENT_USAGE_EXPORT") or APP_DIR / "client_usage_export.py")
 CLIENT_USAGE_JSON = Path(os.environ.get("CLIENT_USAGE_JSON") or APP_DIR / "client_usage_today.json")
 CN_TZ = timezone(timedelta(hours=8), "CST")
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -55,6 +57,132 @@ def env_bool(values: dict[str, str], key: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def normalize_url(value: str | None) -> str:
+    url = (value or "").strip().strip('"').strip("'")
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "http://" + url
+    return url.rstrip("/")
+
+
+def same_endpoint(left: str, right: str) -> bool:
+    left = normalize_url(left)
+    right = normalize_url(right)
+    if not left or not right:
+        return False
+    try:
+        left_url = parse.urlparse(left)
+        right_url = parse.urlparse(right)
+    except Exception:
+        return False
+    left_host = (left_url.hostname or "").lower()
+    right_host = (right_url.hostname or "").lower()
+    left_port = left_url.port or (443 if left_url.scheme == "https" else 80)
+    right_port = right_url.port or (443 if right_url.scheme == "https" else 80)
+    if left_port != right_port:
+        return False
+    if left_host == right_host:
+        return True
+    return left_host in LOCAL_HOSTS and right_host in LOCAL_HOSTS
+
+
+def strip_url_path(url: str) -> str:
+    normalized = normalize_url(url)
+    if not normalized:
+        return ""
+    try:
+        parts = parse.urlparse(normalized)
+    except Exception:
+        return normalized
+    netloc = parts.netloc
+    if not netloc:
+        return normalized
+    return parse.urlunparse((parts.scheme or "http", netloc, "", "", "", ""))
+
+
+def extract_json_urls(value: Any) -> list[str]:
+    urls: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key).lower()
+            if isinstance(child, str) and any(part in key_text for part in ("base_url", "api_base", "api_base_url")):
+                urls.append(child)
+            urls.extend(extract_json_urls(child))
+    elif isinstance(value, list):
+        for child in value:
+            urls.extend(extract_json_urls(child))
+    return urls
+
+
+def read_codex_toml_urls(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    active_provider = ""
+    current_section = ""
+    root_urls: list[str] = []
+    provider_urls: dict[str, list[str]] = {}
+    key_value = re.compile(r"^([A-Za-z0-9_.-]+)\s*=\s*[\"']([^\"']+)[\"']")
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+    for raw_line in lines:
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line.strip("[]").strip()
+            continue
+        match = key_value.match(line)
+        if not match:
+            continue
+        key, value = match.groups()
+        if key == "model_provider" and not current_section:
+            active_provider = value
+            continue
+        if key != "base_url":
+            continue
+        if current_section.startswith("model_providers."):
+            provider = current_section.split(".", 1)[1]
+            provider_urls.setdefault(provider, []).append(value)
+        elif not current_section:
+            root_urls.append(value)
+    urls: list[str] = []
+    if active_provider:
+        urls.extend(provider_urls.get(active_provider, []))
+    urls.extend(root_urls)
+    for provider, values in provider_urls.items():
+        if provider != active_provider:
+            urls.extend(values)
+    return urls
+
+
+def detect_codex_base_urls() -> list[str]:
+    urls: list[str] = []
+    for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_BASE_URL", "CODEX_BASE_URL"):
+        value = os.environ.get(key)
+        if value:
+            urls.append(value)
+    codex_dir = Path(os.path.expanduser("~")) / ".codex"
+    urls.extend(read_codex_toml_urls(codex_dir / "config.toml"))
+    for name in ("auth.json", ".cockpit_codex_auth.json"):
+        path = codex_dir / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        urls.extend(extract_json_urls(data))
+    unique: list[str] = []
+    for url in urls:
+        normalized = normalize_url(url)
+        if normalized and normalized not in unique:
+            unique.append(normalized)
+    return unique
 
 
 def compact_number(value: float | int | None) -> str:
@@ -173,6 +301,8 @@ class MonitorState:
     updated_at: float | None = None
     mode: str = "sub2api"
     source_label: str = "SUB2 监控"
+    usage_source: str = "sub2api"
+    usage_note: str = ""
     active_accounts: list[dict[str, Any]] | None = None
     latest_request: dict[str, Any] | None = None
     latest_account_name: str = ""
@@ -183,7 +313,7 @@ class MonitorState:
     client_usage: dict[str, Any] | None = None
 
 
-def build_local_monitor_state(error_text: str | None = None) -> MonitorState:
+def build_local_monitor_state(error_text: str | None = None, usage_note: str = "本地客户端日志") -> MonitorState:
     client_usage = load_client_usage() or {
         "requests": 0,
         "tokens": 0,
@@ -223,6 +353,8 @@ def build_local_monitor_state(error_text: str | None = None) -> MonitorState:
         updated_at=time.time(),
         mode="local-codex",
         source_label="LOCAL-CODEX",
+        usage_source="local",
+        usage_note=usage_note,
         active_accounts=[],
         latest_request=latest_request,
         latest_account_name="Local client logs",
@@ -242,8 +374,44 @@ class Sub2APIClient:
         self.email = os.environ.get("SUB2API_ADMIN_EMAIL") or env.get("ADMIN_EMAIL") or "admin@sub2api.local"
         self.password = os.environ.get("SUB2API_ADMIN_PASSWORD") or env.get("ADMIN_PASSWORD") or ""
         self.mode = (os.environ.get("SUB2API_MONITOR_MODE") or env.get("SUB2API_MONITOR_MODE") or "auto").strip().lower()
-        self.include_local_usage = env_bool(env, "SUB2API_INCLUDE_LOCAL_USAGE", False)
+        usage_source = os.environ.get("SUB2API_MONITOR_USAGE_SOURCE") or env.get("SUB2API_MONITOR_USAGE_SOURCE") or ""
+        self.usage_source = usage_source.strip().lower() or ("both" if env_bool(env, "SUB2API_INCLUDE_LOCAL_USAGE", False) else "auto")
         self.token: str | None = None
+
+    def _sub2api_match_urls(self) -> list[str]:
+        env = read_env_files(ENV_FILES)
+        urls = [self.base_url]
+        extra = os.environ.get("SUB2API_MATCH_BASE_URLS") or env.get("SUB2API_MATCH_BASE_URLS") or ""
+        for item in extra.split(","):
+            item = item.strip()
+            if item:
+                urls.append(item)
+        return [strip_url_path(url) for url in urls if strip_url_path(url)]
+
+    def _codex_points_to_sub2api(self) -> tuple[bool | None, list[str]]:
+        codex_urls = detect_codex_base_urls()
+        if not codex_urls:
+            return None, []
+        sub2api_urls = self._sub2api_match_urls()
+        active_url = codex_urls[0]
+        if any(same_endpoint(active_url, sub2api_url) for sub2api_url in sub2api_urls):
+            return True, codex_urls
+        return False, codex_urls
+
+    def _resolve_usage_source(self) -> tuple[str, str]:
+        if self.usage_source in {"sub2api", "server"}:
+            return "sub2api", "手动: Sub2API"
+        if self.usage_source in {"local", "local-codex", "client"}:
+            return "local", "手动: 本地日志"
+        if self.usage_source in {"both", "merge", "all"}:
+            return "both", "手动: 合并显示"
+        points_to_sub2api, codex_urls = self._codex_points_to_sub2api()
+        if points_to_sub2api is True:
+            return "sub2api", "Auto: Codex -> Sub2API"
+        if points_to_sub2api is False:
+            first = codex_urls[0] if codex_urls else ""
+            return "local", f"Auto: Codex -> {strip_url_path(first) or 'other API'}"
+        return "sub2api", "Auto: 未确认 Codex endpoint"
 
     def _request(
         self,
@@ -302,6 +470,9 @@ class Sub2APIClient:
     def fetch_state(self) -> MonitorState:
         if self.mode in {"local", "local-codex", "client", "client-local"}:
             return build_local_monitor_state()
+        resolved_source, usage_note = self._resolve_usage_source()
+        if resolved_source == "local":
+            return build_local_monitor_state(usage_note=usage_note)
         try:
             return self.fetch_sub2api_state()
         except Exception as exc:
@@ -310,6 +481,7 @@ class Sub2APIClient:
             raise
 
     def fetch_sub2api_state(self) -> MonitorState:
+        resolved_source, usage_note = self._resolve_usage_source()
         if not self.token:
             self.login()
 
@@ -401,7 +573,7 @@ class Sub2APIClient:
                 }
             )
         top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
-        client_usage = load_client_usage() if self.include_local_usage else None
+        client_usage = load_client_usage() if resolved_source == "both" else None
         if client_usage and (client_usage["tokens"] or client_usage["requests"] or client_usage["cost"]):
             top_accounts.append(
                 {
@@ -419,6 +591,8 @@ class Sub2APIClient:
             updated_at=time.time(),
             mode="sub2api",
             source_label="SUB2 监控",
+            usage_source=resolved_source,
+            usage_note=usage_note,
             active_accounts=active_accounts[:4],
             latest_request=latest,
             latest_account_name=latest_account_name,
@@ -812,6 +986,10 @@ class FloatingMonitorApp:
                 source_text = f"\u542b\u672c\u5730 {compact_number(client_tokens)} tok"
                 c.create_text(COL_R, y + 1, anchor="ne", text=source_text,
                                font=self._fonts["font_tiny"], fill=Theme.text_secondary)
+        elif self.state and self.state.usage_note:
+            c.create_text(COL_R, y + 1, anchor="ne",
+                           text=self._truncate(self.state.usage_note, "font_tiny", 180),
+                           font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         y += 24
 
         stats = [

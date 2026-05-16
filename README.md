@@ -11,6 +11,8 @@ It can run in two useful ways:
 
 When Sub2API is connected, the monitor shows Sub2API server-side stats by default. Local client logs are not merged into the total unless `SUB2API_INCLUDE_LOCAL_USAGE=true`, because Codex still writes local token logs even when requests go through Sub2API.
 
+In `auto` usage-source mode, the monitor checks the current Codex endpoint. If Codex points to your Sub2API URL, totals come from Sub2API only. If Codex points somewhere else, totals come from local client logs.
+
 ## Features
 
 - Always-on-top resizable desktop floating window.
@@ -82,11 +84,25 @@ SUB2API_MONITOR_MODE=local-codex
 CLIENT_USAGE_CODEX_DEFAULT_MODEL=gpt-5.5
 CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS=2000000
 SUB2API_INCLUDE_LOCAL_USAGE=false
+SUB2API_MONITOR_USAGE_SOURCE=auto
 ```
 
 `CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` is a guardrail for abnormal single events.
 
 Set `SUB2API_INCLUDE_LOCAL_USAGE=true` only when you intentionally want Sub2API server stats and local client logs shown together. This is useful for comparing sources, but it can double count requests that already passed through Sub2API.
+
+`SUB2API_MONITOR_USAGE_SOURCE` can be:
+
+- `auto`: detect the current Codex endpoint.
+- `sub2api`: always use Sub2API server-side stats.
+- `local`: always use local Codex/Claude logs.
+- `both`: show Sub2API stats plus local logs together.
+
+If your Sub2API is reachable through more than one local URL or port, set:
+
+```env
+SUB2API_MATCH_BASE_URLS=http://127.0.0.1:8080,http://localhost:8080
+```
 
 ## Forked Codex Sessions
 

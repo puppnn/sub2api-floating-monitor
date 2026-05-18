@@ -248,7 +248,11 @@ def summarize_usage_history(history: dict[str, Any]) -> dict[str, Any]:
     yesterday = series[-2] if len(series) >= 2 else {"cost": 0.0, "tokens": 0, "requests": 0}
     return {
         "today_cost": today["cost"],
+        "today_tokens": today["tokens"],
+        "today_requests": today["requests"],
         "yesterday_cost": yesterday["cost"],
+        "yesterday_tokens": yesterday["tokens"],
+        "yesterday_requests": yesterday["requests"],
         "seven_day_cost": sum(item["cost"] for item in series),
         "seven_day_tokens": sum(item["tokens"] for item in series),
         "seven_day_requests": sum(item["requests"] for item in series),
@@ -1116,17 +1120,17 @@ class FloatingMonitorApp:
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
 
         y += 10
-        c.create_text(COL_L, y, anchor="nw", text="\u82b1\u8d39\u8d8b\u52bf",
+        c.create_text(COL_L, y, anchor="nw", text="Token \u8d8b\u52bf",
                        font=self._fonts["font_section"], fill=Theme.amber)
         history = (self.state.cost_history if self.state else None) or summarize_usage_history(load_usage_history())
         c.create_text(COL_R, y + 1, anchor="ne",
-                       text=f"7\u65e5 {money(history.get('seven_day_cost', 0))}",
+                       text=f"7\u65e5 {compact_number(history.get('seven_day_tokens', 0))} tok",
                        font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         y += 22
         cost_stats = [
-            ("\u4eca\u65e5", money(history.get("today_cost", 0)), Theme.amber_bright),
-            ("\u6628\u65e5", money(history.get("yesterday_cost", 0)), Theme.cyan),
-            ("\u65e5\u5747", money(float(history.get("seven_day_cost") or 0) / 7), Theme.violet),
+            ("\u4eca\u65e5", f"{compact_number(history.get('today_tokens', 0))} tok", Theme.amber_bright),
+            ("\u6628\u65e5", f"{compact_number(history.get('yesterday_tokens', 0))} tok", Theme.cyan),
+            ("\u65e5\u5747", f"{compact_number(float(history.get('seven_day_tokens') or 0) / 7)} tok", Theme.violet),
         ]
         for i, (lbl, val, color) in enumerate(cost_stats):
             cx = COL_L + col_w * i + col_w // 2
@@ -1140,9 +1144,9 @@ class FloatingMonitorApp:
             bar_h = 22
             gap = 5
             bar_w = max(8, int((COL_R - COL_L - gap * 6) / 7))
-            max_cost = max([float(item.get("cost") or 0) for item in series if isinstance(item, dict)], default=0) or 1
+            max_cost = max([float(item.get("tokens") or 0) for item in series if isinstance(item, dict)], default=0) or 1
             for index, item in enumerate(series[:7]):
-                cost = float(item.get("cost") or 0) if isinstance(item, dict) else 0
+                cost = float(item.get("tokens") or 0) if isinstance(item, dict) else 0
                 x1 = COL_L + index * (bar_w + gap)
                 x2 = min(COL_R, x1 + bar_w)
                 fill_h = max(2, int(bar_h * min(1.0, cost / max_cost))) if cost > 0 else 2

@@ -630,7 +630,7 @@ class Sub2APIClient:
                 "GET",
                 "/api/v1/admin/ops/requests",
                 params={
-                    "time_range": "30m",
+                    "time_range": "30d",
                     "kind": "all",
                     "platform": "openai",
                     "page": 1,

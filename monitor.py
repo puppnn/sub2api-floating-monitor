@@ -384,6 +384,36 @@ def load_client_usage() -> dict[str, Any] | None:
     }
 
 
+def local_usage_from_providers(client_usage: dict[str, Any] | None, prefixes: tuple[str, ...]) -> dict[str, Any] | None:
+    if not client_usage:
+        return None
+    providers = client_usage.get("providers")
+    if not isinstance(providers, list):
+        return None
+    selected: list[dict[str, Any]] = []
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        name = str(provider.get("name") or "")
+        if not any(name.lower().startswith(prefix.lower()) for prefix in prefixes):
+            continue
+        selected.append(provider)
+    if not selected:
+        return None
+    requests_count = sum(int(provider.get("requests") or 0) for provider in selected)
+    tokens = sum(int(provider.get("tokens") or 0) for provider in selected)
+    cost = sum(float(provider.get("cost") or 0) for provider in selected)
+    if requests_count <= 0 and tokens <= 0 and cost <= 0:
+        return None
+    return {
+        "requests": requests_count,
+        "tokens": tokens,
+        "cost": cost,
+        "providers": selected,
+        "updated_at": client_usage.get("updated_at") or "",
+    }
+
+
 @dataclass
 class MonitorState:
     loading: bool = True
@@ -698,7 +728,11 @@ class Sub2APIClient:
                 }
             )
         top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
-        client_usage = load_client_usage() if resolved_source == "both" else None
+        raw_client_usage = load_client_usage()
+        if resolved_source == "both":
+            client_usage = raw_client_usage
+        else:
+            client_usage = local_usage_from_providers(raw_client_usage, ("Claude local",))
         if client_usage and (client_usage["tokens"] or client_usage["requests"] or client_usage["cost"]):
             top_accounts.append(
                 {

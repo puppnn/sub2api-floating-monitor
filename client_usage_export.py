@@ -138,14 +138,9 @@ def codex_fork_replay_cutoff(lines: list[str]) -> datetime | None:
 def iter_recent_jsonl(root: Path, start: datetime) -> list[Path]:
     if not root.exists():
         return []
-    cutoff = start - timedelta(hours=6)
     paths: list[Path] = []
     for path in root.rglob("*.jsonl"):
-        try:
-            if datetime.fromtimestamp(path.stat().st_mtime) >= cutoff:
-                paths.append(path)
-        except OSError:
-            continue
+        paths.append(path)
     return paths
 
 

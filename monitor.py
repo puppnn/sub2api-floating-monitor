@@ -474,6 +474,7 @@ def load_client_usage() -> dict[str, Any] | None:
         "tokens": int(today.get("tokens") or 0),
         "cost": float(today.get("cost") or 0),
         "providers": data.get("providers") or [],
+        "latest_request": data.get("latest_request") or {},
         "updated_at": data.get("updated_at") or "",
     }
 
@@ -617,12 +618,24 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
     top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
 
     updated_at = client_usage.get("updated_at") if isinstance(client_usage, dict) else ""
+    client_latest = client_usage.get("latest_request") if isinstance(client_usage, dict) else {}
     latest_request = None
-    if updated_at:
+    latest_account_name = "Local client logs"
+    if isinstance(client_latest, dict) and client_latest.get("created_at"):
+        provider_name = str(client_latest.get("provider") or "Local client")
+        latest_request = {
+            "kind": client_latest.get("kind") or "success",
+            "model": client_latest.get("model") or "-",
+            "created_at": client_latest.get("created_at"),
+            "source": "LOCAL",
+        }
+        latest_account_name = f"LOCAL - {local_provider_display_name(provider_name)}"
+    elif updated_at:
         latest_request = {
             "kind": "success",
             "model": "local-codex",
             "created_at": updated_at,
+            "source": "LOCAL",
         }
 
     return MonitorState(
@@ -635,7 +648,7 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
         usage_note=usage_note,
         active_accounts=[],
         latest_request=latest_request,
-        latest_account_name="Local client logs",
+        latest_account_name=latest_account_name,
         today_requests=int(client_usage.get("requests") or 0),
         today_tokens=int(client_usage.get("tokens") or 0),
         today_account_cost=float(client_usage.get("cost") or 0),
@@ -958,6 +971,23 @@ class Sub2APIClient:
                 )
             top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
 
+        display_latest = latest
+        display_latest_account_name = latest_account_name
+        client_latest = client_usage.get("latest_request") if isinstance(client_usage, dict) else {}
+        if isinstance(client_latest, dict) and client_latest.get("created_at"):
+            provider_name = str(client_latest.get("provider") or "Local client")
+            local_latest = {
+                "kind": client_latest.get("kind") or "success",
+                "model": client_latest.get("model") or "-",
+                "created_at": client_latest.get("created_at"),
+                "source": "LOCAL",
+            }
+            local_dt = _parse_time(str(client_latest.get("created_at") or ""))
+            sub_dt = _parse_time(str(latest.get("created_at") or "")) if isinstance(latest, dict) else None
+            if sub_dt is None or (local_dt is not None and local_dt >= sub_dt):
+                display_latest = local_latest
+                display_latest_account_name = f"LOCAL - {local_provider_display_name(provider_name)}"
+
         return MonitorState(
             loading=False,
             updated_at=time.time(),
@@ -966,8 +996,8 @@ class Sub2APIClient:
             usage_source=ledger_source,
             usage_note=ledger_note,
             active_accounts=active_accounts[:4],
-            latest_request=latest,
-            latest_account_name=latest_account_name,
+            latest_request=display_latest,
+            latest_account_name=display_latest_account_name,
             today_requests=today_requests,
             today_tokens=today_tokens,
             today_account_cost=today_account_cost,

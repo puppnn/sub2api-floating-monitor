@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = APP_DIR / "client_usage_today.json"
 CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.5")
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
+LOCAL_TZ = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -25,6 +26,8 @@ class UsageBucket:
     cache_read_input_tokens: int = 0
     cost: float = 0.0
     models: dict[str, int] = field(default_factory=dict)
+    latest_at: datetime | None = None
+    latest_model: str = ""
 
     @property
     def total_tokens(self) -> int:
@@ -39,6 +42,13 @@ class UsageBucket:
     def add_model(self, model: str, tokens: int) -> None:
         model = (model or "unknown").strip() or "unknown"
         self.models[model] = self.models.get(model, 0) + max(0, int(tokens or 0))
+
+    def mark_latest(self, when: datetime | None, model: str) -> None:
+        if when is None:
+            return
+        if self.latest_at is None or when > self.latest_at:
+            self.latest_at = when
+            self.latest_model = (model or "unknown").strip() or "unknown"
 
 
 PRICE_PER_MILLION: list[tuple[str, tuple[float, float, float]]] = [
@@ -90,6 +100,7 @@ def add_codex_usage(
     input_tokens: int,
     cached_tokens: int,
     output_tokens: int,
+    when: datetime | None = None,
 ) -> None:
     uncached_input = max(0, input_tokens - max(0, cached_tokens))
     cached_input = max(0, cached_tokens)
@@ -103,6 +114,7 @@ def add_codex_usage(
     bucket.output_tokens += output
     bucket.cost += estimate_cost(model, uncached_input, cached_input, output)
     bucket.add_model(model, total)
+    bucket.mark_latest(when, model)
 
 
 def parse_dt(value: Any) -> datetime | None:
@@ -112,7 +124,7 @@ def parse_dt(value: Any) -> datetime | None:
         text = str(value).replace("Z", "+00:00")
         dt = datetime.fromisoformat(text)
         if dt.tzinfo is not None:
-            dt = dt.astimezone().replace(tzinfo=None)
+            dt = dt.astimezone(LOCAL_TZ).replace(tzinfo=None)
         return dt
     except Exception:
         return None
@@ -219,7 +231,7 @@ def scan_codex(root: Path, start: datetime, end: datetime) -> UsageBucket:
                 )
                 if event_key not in seen_events:
                     seen_events.add(event_key)
-                    add_codex_usage(bucket, model, input_tokens, cached_tokens, output_tokens)
+                    add_codex_usage(bucket, model, input_tokens, cached_tokens, output_tokens, ts)
                 last_total = current
                 continue
             delta_input = current["input_tokens"] - last_total["input_tokens"]
@@ -241,7 +253,7 @@ def scan_codex(root: Path, start: datetime, end: datetime) -> UsageBucket:
             )
             if event_key not in seen_events:
                 seen_events.add(event_key)
-                add_codex_usage(bucket, model, delta_input, delta_cached, delta_output)
+                add_codex_usage(bucket, model, delta_input, delta_cached, delta_output, ts)
             last_total = current
     return bucket
 
@@ -282,7 +294,14 @@ def scan_claude(root: Path, start: datetime, end: datetime) -> UsageBucket:
             bucket.cache_read_input_tokens += cache_read
             bucket.cost += estimate_cost(model, input_tokens + cache_creation, cache_read, output_tokens)
             bucket.add_model(model, total)
+            bucket.mark_latest(ts, model)
     return bucket
+
+
+def latest_at_text(bucket: UsageBucket) -> str:
+    if bucket.latest_at is None:
+        return ""
+    return bucket.latest_at.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
 
 
 def bucket_to_dict(name: str, bucket: UsageBucket) -> dict[str, Any]:
@@ -296,6 +315,8 @@ def bucket_to_dict(name: str, bucket: UsageBucket) -> dict[str, Any]:
         "output_tokens": bucket.output_tokens,
         "cost": round(bucket.cost, 6),
         "models": dict(sorted(bucket.models.items(), key=lambda item: item[1], reverse=True)[:8]),
+        "latest_at": latest_at_text(bucket),
+        "latest_model": bucket.latest_model,
     }
 
 
@@ -326,6 +347,20 @@ def main() -> int:
         total.cache_read_input_tokens += bucket.cache_read_input_tokens
         total.output_tokens += bucket.output_tokens
         total.cost += bucket.cost
+        total.mark_latest(bucket.latest_at, bucket.latest_model)
+
+    latest_provider = ""
+    latest_model = ""
+    latest_at = ""
+    latest_dt: datetime | None = None
+    for provider_name, bucket in (("Codex local", codex), ("Claude local", claude)):
+        if bucket.latest_at is None:
+            continue
+        if latest_dt is None or bucket.latest_at > latest_dt:
+            latest_dt = bucket.latest_at
+            latest_provider = provider_name
+            latest_model = bucket.latest_model
+            latest_at = latest_at_text(bucket)
 
     output = {
         "schema": 1,
@@ -334,6 +369,12 @@ def main() -> int:
         "date": day.isoformat(),
         "today": bucket_to_dict("Client local", total),
         "providers": providers,
+        "latest_request": {
+            "provider": latest_provider,
+            "model": latest_model,
+            "created_at": latest_at,
+            "kind": "success" if latest_at else "",
+        },
     }
 
     out = Path(args.output)

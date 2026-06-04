@@ -221,6 +221,8 @@ def current_cockpit_account_label() -> str:
 
 def local_provider_display_name(provider_name: str) -> str:
     name = (provider_name or "Local client").strip() or "Local client"
+    if name.lower().startswith("codex local - "):
+        return name
     label = current_cockpit_account_label()
     if label and name.lower().startswith("codex"):
         return f"Codex local - {label}"

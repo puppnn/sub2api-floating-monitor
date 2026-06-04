@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -115,6 +116,19 @@ def add_codex_usage(
     bucket.cost += estimate_cost(model, uncached_input, cached_input, output)
     bucket.add_model(model, total)
     bucket.mark_latest(when, model)
+
+
+def add_bucket(target: UsageBucket, source: UsageBucket) -> None:
+    target.requests += source.requests
+    target.input_tokens += source.input_tokens
+    target.cached_input_tokens += source.cached_input_tokens
+    target.output_tokens += source.output_tokens
+    target.cache_creation_input_tokens += source.cache_creation_input_tokens
+    target.cache_read_input_tokens += source.cache_read_input_tokens
+    target.cost += source.cost
+    for model, tokens in source.models.items():
+        target.models[model] = target.models.get(model, 0) + tokens
+    target.mark_latest(source.latest_at, source.latest_model)
 
 
 def parse_dt(value: Any) -> datetime | None:
@@ -258,6 +272,132 @@ def scan_codex(root: Path, start: datetime, end: datetime) -> UsageBucket:
     return bucket
 
 
+def local_epoch_ms(value: datetime) -> int:
+    return int(value.replace(tzinfo=LOCAL_TZ).timestamp() * 1000)
+
+
+def ms_to_local_datetime(value: int | float | str | None) -> datetime | None:
+    try:
+        millis = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    if millis <= 0:
+        return None
+    return datetime.fromtimestamp(millis / 1000, tz=LOCAL_TZ).replace(tzinfo=None)
+
+
+def cockpit_account_label(account_id: str, email: str, api_key_label: str) -> str:
+    email = (email or "").strip()
+    if email:
+        return f"Codex local - {email}"
+    api_key_label = (api_key_label or "").strip()
+    if api_key_label:
+        return f"Codex local - {api_key_label}"
+    account_id = (account_id or "").strip()
+    if account_id:
+        return f"Codex local - {account_id}"
+    return "Codex local - Unknown"
+
+
+def current_codex_account_label(home: Path) -> str:
+    codex_dir = home / ".codex"
+    for name in (".cockpit_codex_auth.json", "auth.json"):
+        path = codex_dir / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        email = str(data.get("email") or data.get("OPENAI_EMAIL") or "").strip()
+        if not email:
+            tokens = data.get("tokens") if isinstance(data, dict) else None
+            if isinstance(tokens, dict):
+                email = str(tokens.get("email") or "").strip()
+        if email:
+            return f"Codex local - {email}"
+        api_provider_name = str(data.get("api_provider_name") or "").strip()
+        if api_provider_name:
+            return f"Codex local - {api_provider_name}"
+        api_key_id = str(data.get("api_provider_id") or "").strip()
+        if api_key_id:
+            return f"Codex local - {api_key_id}"
+        account_id = str(data.get("account_id") or "").strip()
+        if account_id:
+            return f"Codex local - {account_id}"
+    return "Codex local"
+
+
+def scan_cockpit_codex_accounts(root: Path, start: datetime, end: datetime) -> dict[str, UsageBucket]:
+    db_path = root / ".antigravity_cockpit" / "codex_local_access_logs.sqlite"
+    if not db_path.exists():
+        return {}
+    start_ms = local_epoch_ms(start)
+    end_ms = local_epoch_ms(end)
+    buckets: dict[str, UsageBucket] = {}
+    try:
+        con = sqlite3.connect(db_path)
+        rows = con.execute(
+            """
+            SELECT
+                timestamp,
+                account_id,
+                email,
+                api_key_label,
+                model_id,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                cached_tokens,
+                estimated_cost_usd
+            FROM request_logs
+            WHERE timestamp >= ? AND timestamp < ?
+            """,
+            (start_ms, end_ms),
+        ).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return {}
+
+    for row in rows:
+        (
+            timestamp,
+            account_id,
+            email,
+            api_key_label,
+            model,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cached_tokens,
+            estimated_cost_usd,
+        ) = row
+        total_tokens = max(0, int(total_tokens or 0))
+        input_tokens = max(0, int(input_tokens or 0))
+        output_tokens = max(0, int(output_tokens or 0))
+        cached_tokens = max(0, int(cached_tokens or 0))
+        if total_tokens <= 0 and input_tokens <= 0 and output_tokens <= 0 and cached_tokens <= 0:
+            continue
+        model = codex_model_name(str(model or "codex"))
+        label = cockpit_account_label(str(account_id or ""), str(email or ""), str(api_key_label or ""))
+        bucket = buckets.setdefault(label, UsageBucket())
+        bucket.requests += 1
+        bucket.input_tokens += max(0, input_tokens - cached_tokens)
+        bucket.cached_input_tokens += cached_tokens
+        bucket.output_tokens += output_tokens
+        event_total = total_tokens or (input_tokens + output_tokens + cached_tokens)
+        try:
+            cost = float(estimated_cost_usd or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        if cost <= 0:
+            cost = estimate_cost(model, max(0, input_tokens - cached_tokens), cached_tokens, output_tokens)
+        bucket.cost += cost
+        bucket.add_model(model, event_total)
+        bucket.mark_latest(ms_to_local_datetime(timestamp), model)
+    return buckets
+
+
 def scan_claude(root: Path, start: datetime, end: datetime) -> UsageBucket:
     bucket = UsageBucket()
     for path in iter_recent_jsonl(root, start):
@@ -335,9 +475,22 @@ def main() -> int:
     end = start + timedelta(days=1)
 
     home = Path(os.path.expanduser("~"))
-    codex = scan_codex(home / ".codex" / "sessions", start, end)
+    codex_jsonl = scan_codex(home / ".codex" / "sessions", start, end)
+    codex_accounts = scan_cockpit_codex_accounts(home, start, end)
+    codex = UsageBucket()
+    for bucket in codex_accounts.values():
+        add_bucket(codex, bucket)
+    if codex.total_tokens <= 0 and codex.requests <= 0:
+        codex = codex_jsonl
+        codex_provider_buckets = [(current_codex_account_label(home), codex)]
+    else:
+        codex_provider_buckets = sorted(
+            codex_accounts.items(),
+            key=lambda item: (-item[1].total_tokens, -item[1].requests, item[0]),
+        )
     claude = scan_claude(home / ".claude" / "projects", start, end)
-    providers = [bucket_to_dict("Codex local", codex), bucket_to_dict("Claude local", claude)]
+    codex_providers = [bucket_to_dict(name, bucket) for name, bucket in codex_provider_buckets]
+    providers = codex_providers + [bucket_to_dict("Claude local", claude)]
     total = UsageBucket()
     for bucket in (codex, claude):
         total.requests += bucket.requests
@@ -353,7 +506,8 @@ def main() -> int:
     latest_model = ""
     latest_at = ""
     latest_dt: datetime | None = None
-    for provider_name, bucket in (("Codex local", codex), ("Claude local", claude)):
+    latest_candidates = list(codex_provider_buckets) + [("Claude local", claude)]
+    for provider_name, bucket in latest_candidates:
         if bucket.latest_at is None:
             continue
         if latest_dt is None or bucket.latest_at > latest_dt:

@@ -24,7 +24,7 @@ ENV_FILES = [
 ]
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
 REFRESH_SECONDS = 3
-CLIENT_USAGE_CACHE_SECONDS = int(os.environ.get("SUB2API_CLIENT_USAGE_CACHE_SECONDS", "180"))
+CLIENT_USAGE_CACHE_SECONDS = int(os.environ.get("SUB2API_CLIENT_USAGE_CACHE_SECONDS", "10"))
 CLIENT_USAGE_EXPORT = Path(os.environ.get("CLIENT_USAGE_EXPORT") or APP_DIR / "client_usage_export.py")
 if not CLIENT_USAGE_EXPORT.exists():
     fallback_export = APP_DIR.parent / "client-token-importer" / "client_usage_export.py"
@@ -755,6 +755,10 @@ class Sub2APIClient:
         self._client_usage_cache = client_usage
         self._client_usage_cache_at = now
         return client_usage
+
+    def clear_client_usage_cache(self) -> None:
+        self._client_usage_cache = None
+        self._client_usage_cache_at = 0.0
 
     def _request(
         self,
@@ -1596,6 +1600,7 @@ class FloatingMonitorApp:
             self._draw()
             return
         if btn == "btn_refresh":
+            self.client.clear_client_usage_cache()
             self.refresh_async()
             return
         if self._hit_resize_handle(event.x, event.y):

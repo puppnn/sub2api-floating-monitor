@@ -164,9 +164,17 @@ def codex_fork_replay_cutoff(lines: list[str]) -> datetime | None:
 def iter_recent_jsonl(root: Path, start: datetime) -> list[Path]:
     if not root.exists():
         return []
+    day_dir = root / f"{start.year:04d}" / f"{start.month:02d}" / f"{start.day:02d}"
+    if day_dir.exists():
+        return list(day_dir.glob("*.jsonl"))
     paths: list[Path] = []
     for path in root.rglob("*.jsonl"):
-        paths.append(path)
+        try:
+            modified = datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            continue
+        if modified >= start - timedelta(hours=2):
+            paths.append(path)
     return paths
 
 

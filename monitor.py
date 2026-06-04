@@ -24,10 +24,20 @@ ENV_FILES = [
 ]
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
 REFRESH_SECONDS = 3
+CLIENT_USAGE_CACHE_SECONDS = int(os.environ.get("SUB2API_CLIENT_USAGE_CACHE_SECONDS", "180"))
 CLIENT_USAGE_EXPORT = Path(os.environ.get("CLIENT_USAGE_EXPORT") or APP_DIR / "client_usage_export.py")
+if not CLIENT_USAGE_EXPORT.exists():
+    fallback_export = APP_DIR.parent / "client-token-importer" / "client_usage_export.py"
+    if fallback_export.exists():
+        CLIENT_USAGE_EXPORT = fallback_export
 CLIENT_USAGE_JSON = Path(os.environ.get("CLIENT_USAGE_JSON") or APP_DIR / "client_usage_today.json")
+if not CLIENT_USAGE_JSON.exists():
+    fallback_json = APP_DIR.parent / "client-token-importer" / "client_usage_today.json"
+    if fallback_json.exists():
+        CLIENT_USAGE_JSON = fallback_json
 USAGE_HISTORY_JSON = Path(os.environ.get("SUB2API_USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
 CN_TZ = timezone(timedelta(hours=8), "CST")
+DISPLAY_TIMEZONE = "Asia/Shanghai"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 
@@ -186,6 +196,37 @@ def detect_codex_base_urls() -> list[str]:
     return unique
 
 
+def current_cockpit_account_label() -> str:
+    codex_dir = Path(os.path.expanduser("~")) / ".codex"
+    for name in (".cockpit_codex_auth.json", "auth.json"):
+        path = codex_dir / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        email = str(data.get("email") or data.get("OPENAI_EMAIL") or "").strip()
+        if not email:
+            tokens = data.get("tokens") if isinstance(data, dict) else None
+            if isinstance(tokens, dict):
+                email = str(tokens.get("email") or "").strip()
+        if email:
+            return email
+        account_id = str(data.get("account_id") or "").strip()
+        if account_id:
+            return account_id
+    return ""
+
+
+def local_provider_display_name(provider_name: str) -> str:
+    name = (provider_name or "Local client").strip() or "Local client"
+    label = current_cockpit_account_label()
+    if label and name.lower().startswith("codex"):
+        return f"Codex local - {label}"
+    return name
+
+
 def compact_number(value: float | int | None) -> str:
     number = float(value or 0)
     sign = "-" if number < 0 else ""
@@ -245,6 +286,44 @@ def summarize_usage_history(history: dict[str, Any]) -> dict[str, Any]:
             }
         )
     today = series[-1]
+    yesterday = series[-2] if len(series) >= 2 else {"cost": 0.0, "tokens": 0, "requests": 0}
+    return {
+        "today_cost": today["cost"],
+        "today_tokens": today["tokens"],
+        "today_requests": today["requests"],
+        "yesterday_cost": yesterday["cost"],
+        "yesterday_tokens": yesterday["tokens"],
+        "yesterday_requests": yesterday["requests"],
+        "seven_day_cost": sum(item["cost"] for item in series),
+        "seven_day_tokens": sum(item["tokens"] for item in series),
+        "seven_day_requests": sum(item["requests"] for item in series),
+        "series": series,
+    }
+
+
+def summarize_trend_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_date: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("date") or "").strip()
+        if key:
+            by_date[key] = row
+
+    series: list[dict[str, Any]] = []
+    for offset in range(6, -1, -1):
+        key = date_key(offset)
+        row = by_date.get(key, {})
+        series.append(
+            {
+                "date": key,
+                "cost": float(row.get("actual_cost") or row.get("cost") or 0),
+                "tokens": int(row.get("total_tokens") or row.get("tokens") or 0),
+                "requests": int(row.get("requests") or 0),
+            }
+        )
+
+    today = series[-1] if series else {"cost": 0.0, "tokens": 0, "requests": 0}
     yesterday = series[-2] if len(series) >= 2 else {"cost": 0.0, "tokens": 0, "requests": 0}
     return {
         "today_cost": today["cost"],
@@ -405,21 +484,23 @@ def local_usage_from_providers(client_usage: dict[str, Any] | None, prefixes: tu
     providers = client_usage.get("providers")
     if not isinstance(providers, list):
         return None
+
     selected: list[dict[str, Any]] = []
     for provider in providers:
         if not isinstance(provider, dict):
             continue
         name = str(provider.get("name") or "")
-        if not any(name.lower().startswith(prefix.lower()) for prefix in prefixes):
-            continue
-        selected.append(provider)
+        if any(name.lower().startswith(prefix.lower()) for prefix in prefixes):
+            selected.append(provider)
     if not selected:
         return None
+
     requests_count = sum(int(provider.get("requests") or 0) for provider in selected)
     tokens = sum(int(provider.get("tokens") or 0) for provider in selected)
     cost = sum(float(provider.get("cost") or 0) for provider in selected)
     if requests_count <= 0 and tokens <= 0 and cost <= 0:
         return None
+
     return {
         "requests": requests_count,
         "tokens": tokens,
@@ -427,6 +508,65 @@ def local_usage_from_providers(client_usage: dict[str, Any] | None, prefixes: tu
         "providers": selected,
         "updated_at": client_usage.get("updated_at") or "",
     }
+
+
+def combine_client_usage(usages: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+    selected = [usage for usage in usages if usage and (usage.get("requests") or usage.get("tokens") or usage.get("cost"))]
+    if not selected:
+        return None
+
+    providers: list[dict[str, Any]] = []
+    for usage in selected:
+        usage_providers = usage.get("providers")
+        if isinstance(usage_providers, list):
+            providers.extend([provider for provider in usage_providers if isinstance(provider, dict)])
+
+    return {
+        "requests": sum(int(usage.get("requests") or 0) for usage in selected),
+        "tokens": sum(int(usage.get("tokens") or 0) for usage in selected),
+        "cost": sum(float(usage.get("cost") or 0) for usage in selected),
+        "providers": providers,
+        "updated_at": max([str(usage.get("updated_at") or "") for usage in selected], default=""),
+    }
+
+
+def residual_client_usage(
+    client_usage: dict[str, Any] | None,
+    server_requests: int,
+    server_tokens: int,
+    server_cost: float,
+) -> dict[str, Any] | None:
+    if not client_usage:
+        return None
+
+    raw_requests = int(client_usage.get("requests") or 0)
+    raw_tokens = int(client_usage.get("tokens") or 0)
+    raw_cost = float(client_usage.get("cost") or 0)
+    if raw_requests <= 0 and raw_tokens <= 0 and raw_cost <= 0:
+        return None
+
+    local_requests = max(0, raw_requests - max(0, int(server_requests or 0)))
+    local_tokens = max(0, raw_tokens - max(0, int(server_tokens or 0)))
+    local_cost = max(0.0, raw_cost - max(0.0, float(server_cost or 0)))
+    if local_tokens > 0 and local_requests == 0:
+        local_requests = 1
+    if local_tokens > 0 and local_cost == 0 and raw_tokens > 0:
+        local_cost = raw_cost * (local_tokens / raw_tokens)
+
+    if local_requests <= 0 and local_tokens <= 0 and local_cost <= 0:
+        return None
+
+    result = dict(client_usage)
+    result["requests"] = local_requests
+    result["tokens"] = local_tokens
+    result["cost"] = local_cost
+    result["raw_requests"] = raw_requests
+    result["raw_tokens"] = raw_tokens
+    result["raw_cost"] = raw_cost
+    result["deducted_requests"] = max(0, int(server_requests or 0))
+    result["deducted_tokens"] = max(0, int(server_tokens or 0))
+    result["deducted_cost"] = max(0.0, float(server_cost or 0))
+    return result
 
 
 @dataclass
@@ -447,6 +587,7 @@ class MonitorState:
     cost_history: dict[str, Any] | None = None
     top_accounts: list[dict[str, Any]] | None = None
     client_usage: dict[str, Any] | None = None
+    client_usage_history: dict[str, Any] | None = None
 
 
 def build_local_monitor_state(error_text: str | None = None, usage_note: str = "本地客户端日志") -> MonitorState:
@@ -465,11 +606,12 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
                 continue
             top_accounts.append(
                 {
-                    "name": provider.get("name") or "Local client",
+                    "name": local_provider_display_name(str(provider.get("name") or "Local client")),
                     "tokens": int(provider.get("tokens") or 0),
                     "requests": int(provider.get("requests") or 0),
                     "cost": float(provider.get("cost") or 0),
-                    "health_badge": "本地",
+                    "health_badge": "",
+                    "source_badge": "LOCAL",
                 }
             )
     top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
@@ -499,6 +641,7 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
         today_account_cost=float(client_usage.get("cost") or 0),
         top_accounts=top_accounts,
         client_usage=client_usage,
+        client_usage_history=summarize_usage_history(load_usage_history()),
     )
 
 
@@ -519,7 +662,18 @@ def build_sub2api_error_state(error_text: str, usage_note: str) -> MonitorState:
         today_account_cost=0.0,
         top_accounts=[],
         client_usage=None,
+        client_usage_history=summarize_usage_history(load_usage_history()),
     )
+
+
+def empty_client_usage() -> dict[str, Any]:
+    return {
+        "requests": 0,
+        "tokens": 0,
+        "cost": 0.0,
+        "providers": [],
+        "updated_at": "",
+    }
 
 
 class Sub2APIClient:
@@ -527,24 +681,14 @@ class Sub2APIClient:
         env = read_env_files(ENV_FILES)
         self.base_url = os.environ.get("SUB2API_BASE_URL") or env.get("SUB2API_BASE_URL") or DEFAULT_BASE_URL
         self.base_url = self.base_url.rstrip("/")
-        self.email = (
-            os.environ.get("SUB2API_ADMIN_EMAIL")
-            or os.environ.get("ADMIN_EMAIL")
-            or env.get("SUB2API_ADMIN_EMAIL")
-            or env.get("ADMIN_EMAIL")
-            or "admin@sub2api.local"
-        )
-        self.password = (
-            os.environ.get("SUB2API_ADMIN_PASSWORD")
-            or os.environ.get("ADMIN_PASSWORD")
-            or env.get("SUB2API_ADMIN_PASSWORD")
-            or env.get("ADMIN_PASSWORD")
-            or ""
-        )
+        self.email = os.environ.get("SUB2API_ADMIN_EMAIL") or env.get("ADMIN_EMAIL") or "admin@sub2api.local"
+        self.password = os.environ.get("SUB2API_ADMIN_PASSWORD") or env.get("ADMIN_PASSWORD") or ""
         self.mode = (os.environ.get("SUB2API_MONITOR_MODE") or env.get("SUB2API_MONITOR_MODE") or "auto").strip().lower()
         usage_source = os.environ.get("SUB2API_MONITOR_USAGE_SOURCE") or env.get("SUB2API_MONITOR_USAGE_SOURCE") or ""
         self.usage_source = usage_source.strip().lower() or ("both" if env_bool(env, "SUB2API_INCLUDE_LOCAL_USAGE", False) else "auto")
         self.token: str | None = None
+        self._client_usage_cache: dict[str, Any] | None = None
+        self._client_usage_cache_at: float = 0.0
 
     def _sub2api_match_urls(self) -> list[str]:
         env = read_env_files(ENV_FILES)
@@ -567,8 +711,6 @@ class Sub2APIClient:
         return False, codex_urls
 
     def _resolve_usage_source(self) -> tuple[str, str]:
-        if self.mode in {"sub2api", "server"}:
-            return "sub2api", "手动: Sub2API"
         if self.usage_source in {"sub2api", "server"}:
             return "sub2api", "手动: Sub2API"
         if self.usage_source in {"local", "local-codex", "client"}:
@@ -581,7 +723,23 @@ class Sub2APIClient:
         if points_to_sub2api is False:
             first = codex_urls[0] if codex_urls else ""
             return "local", f"Auto: Codex -> {strip_url_path(first) or 'other API'}"
-        return "sub2api", "Auto: 未确认 Codex endpoint"
+        return "local", "Auto: 未确认 Codex endpoint"
+
+    def _should_include_client_usage(self, resolved_source: str) -> bool:
+        if self.usage_source in {"sub2api", "server"}:
+            return False
+        if self.usage_source in {"both", "merge", "all", "local", "local-codex", "client"}:
+            return True
+        return resolved_source in {"sub2api", "local", "both"}
+
+    def _load_client_usage_cached(self) -> dict[str, Any] | None:
+        now = time.time()
+        if self._client_usage_cache is not None and now - self._client_usage_cache_at < CLIENT_USAGE_CACHE_SECONDS:
+            return self._client_usage_cache
+        client_usage = load_client_usage()
+        self._client_usage_cache = client_usage
+        self._client_usage_cache_at = now
+        return client_usage
 
     def _request(
         self,
@@ -621,6 +779,19 @@ class Sub2APIClient:
             raise RuntimeError(str(data.get("message") or data.get("reason") or "接口返回错误"))
         return data
 
+    def _fetch_dashboard_trend(self) -> dict[str, Any]:
+        params = {
+            "start_date": date_key(6),
+            "end_date": today_key(),
+            "granularity": "day",
+            "timezone": DISPLAY_TIMEZONE,
+        }
+        data = self._request("GET", "/api/v1/admin/dashboard/trend", params=params) or {}
+        trend = data.get("trend") if isinstance(data, dict) else []
+        if not isinstance(trend, list):
+            trend = []
+        return summarize_trend_rows([row for row in trend if isinstance(row, dict)])
+
     def login(self) -> None:
         if not self.password:
             raise RuntimeError("没有找到管理员密码，请检查 deploy/.env 或 SUB2API_ADMIN_PASSWORD")
@@ -641,8 +812,6 @@ class Sub2APIClient:
         if self.mode in {"local", "local-codex", "client", "client-local"}:
             return build_local_monitor_state()
         resolved_source, usage_note = self._resolve_usage_source()
-        if resolved_source == "local":
-            return build_local_monitor_state(usage_note=usage_note)
         try:
             return self.fetch_sub2api_state()
         except Exception as exc:
@@ -689,6 +858,11 @@ class Sub2APIClient:
             latest = (requests_resp.get("items") or [None])[0]
         except Exception:
             latest = None
+
+        try:
+            trend_history = self._fetch_dashboard_trend()
+        except Exception:
+            trend_history = summarize_usage_history(load_usage_history())
 
         account_ids = [int(item["id"]) for item in accounts if item.get("id") is not None]
         today_by_account: dict[str, Any] = {}
@@ -743,41 +917,64 @@ class Sub2APIClient:
                     "requests": requests_count,
                     "cost": cost,
                     "health_badge": account_health_badge(account),
+                    "source_badge": "SUB",
                 }
             )
         top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
-        raw_client_usage = load_client_usage()
-        if resolved_source == "both":
-            client_usage = raw_client_usage
-        else:
-            client_usage = local_usage_from_providers(raw_client_usage, ("Claude local",))
+        raw_client_usage = self._load_client_usage_cached()
+        client_usage = raw_client_usage
         if client_usage and (client_usage["tokens"] or client_usage["requests"] or client_usage["cost"]):
-            top_accounts.append(
-                {
-                    "name": "Client local / 本地客户端日志",
-                    "tokens": client_usage["tokens"],
-                    "requests": client_usage["requests"],
-                    "cost": client_usage["cost"],
-                    "health_badge": "本地",
-                }
-            )
+            today_requests = int(client_usage.get("requests") or 0)
+            today_tokens = int(client_usage.get("tokens") or 0)
+            today_account_cost = float(client_usage.get("cost") or 0)
+            ledger_source = "local"
+            ledger_note = f"{usage_note} / 本地日志总量 + Sub2API账号拆分"
+        else:
+            today_requests = int(stats.get("today_requests") or realtime_today_requests)
+            today_tokens = int(stats.get("today_tokens") or realtime_today_tokens)
+            today_account_cost = float(stats.get("today_actual_cost") or realtime_today_cost)
+            ledger_source = resolved_source
+            ledger_note = usage_note
+
+        providers = client_usage.get("providers") if isinstance(client_usage, dict) else []
+        if isinstance(providers, list):
+            for provider in providers:
+                if not isinstance(provider, dict):
+                    continue
+                provider_tokens = int(provider.get("tokens") or 0)
+                provider_requests = int(provider.get("requests") or 0)
+                provider_cost = float(provider.get("cost") or 0)
+                if provider_tokens <= 0 and provider_requests <= 0 and provider_cost <= 0:
+                    continue
+                top_accounts.append(
+                    {
+                        "name": local_provider_display_name(str(provider.get("name") or "Local client")),
+                        "tokens": provider_tokens,
+                        "requests": provider_requests,
+                        "cost": provider_cost,
+                        "health_badge": "",
+                        "source_badge": "LOCAL",
+                    }
+                )
             top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
 
         return MonitorState(
             loading=False,
             updated_at=time.time(),
             mode="sub2api",
-            source_label="SUB2 监控",
-            usage_source=resolved_source,
-            usage_note=usage_note,
+            source_label="LOCAL + SUB",
+            usage_source=ledger_source,
+            usage_note=ledger_note,
             active_accounts=active_accounts[:4],
             latest_request=latest,
             latest_account_name=latest_account_name,
-            today_requests=realtime_today_requests + int((client_usage or {}).get("requests") or 0),
-            today_tokens=realtime_today_tokens + int((client_usage or {}).get("tokens") or 0),
-            today_account_cost=realtime_today_cost + float((client_usage or {}).get("cost") or 0),
+            today_requests=today_requests,
+            today_tokens=today_tokens,
+            today_account_cost=today_account_cost,
+            cost_history=trend_history,
             top_accounts=top_accounts,
             client_usage=client_usage,
+            client_usage_history=summarize_usage_history(load_usage_history()),
         )
 
 
@@ -996,6 +1193,10 @@ class FloatingMonitorApp:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _health_color(self, label: str) -> str:
+        if label == "LOCAL":
+            return Theme.accent_green
+        if label == "SUB":
+            return Theme.cyan
         if label in {"\u9650\u989d", "\u9650\u6d41", "\u51b7\u5374"}:
             return Theme.amber_bright
         if label in {"\u4e0d\u53ef\u7528", "\u505c\u7528", "\u9519\u8bef"}:
@@ -1084,11 +1285,7 @@ class FloatingMonitorApp:
         self._draw_rounded_rect(COL_L, y, COL_R, y + 72, r=13, fill=Theme.bg_section, outline=Theme.border)
         accounts = (self.state.active_accounts if self.state else [])[:5]
         latest_name = self.state.latest_account_name if self.state else ""
-        if self.state and self.state.mode == "local-codex":
-            hero_name = "Local Codex / Claude"
-            hero_sub = "\u4ec5\u7edf\u8ba1\u672c\u673a\u5ba2\u6237\u7aef\u65e5\u5fd7"
-            hero_color = Theme.cyan
-        elif accounts:
+        if accounts:
             hero_name = accounts[0].get("name", latest_name or "-")
             total_current = sum(int(account.get("current") or 0) for account in accounts)
             hero_sub = f"{len(accounts)} \u4e2a\u8d26\u53f7\u6d3b\u8dc3 / \u603b\u5e76\u53d1 {total_current}"
@@ -1101,16 +1298,9 @@ class FloatingMonitorApp:
         c.create_rectangle(COL_L + 12, y + 13, COL_L + 58, y + 15, fill=Theme.cyan, outline="")
         c.create_text(COL_L + 12, y + 22, anchor="nw", text=self._truncate(hero_name, "font_label_bold", COL_R - COL_L - 32),
                       font=self._fonts["font_label_bold"], fill=Theme.text_primary)
-        source_pill = "\u672c\u5730"
-        source_color = Theme.amber_bright
-        if self.state and self.state.usage_source == "sub2api":
-            source_pill = "Sub2API"
-            source_color = Theme.accent_green
-        elif self.state and self.state.usage_source == "both":
-            source_pill = "\u6df7\u5408"
-            source_color = Theme.cyan
         self._draw_pill(COL_L + 12, y + 44, hero_sub, hero_color, 170)
-        self._draw_pill(COL_R - 94, y + 44, source_pill, source_color, 76)
+        if self.state and self.state.client_usage:
+            self._draw_pill(COL_R - 94, y + 44, "\u672c\u5730", Theme.amber_bright, 76)
         y += 82
 
         # ════════════════════════════════════════════════════════
@@ -1120,11 +1310,7 @@ class FloatingMonitorApp:
                        font=self._fonts["font_section"], fill=Theme.amber)
 
         y += 24
-        if self.state and self.state.mode == "local-codex":
-            c.create_text(COL_L + 8, y, anchor="nw", text="\u672c\u5730\u6a21\u5f0f\u4e0d\u663e\u793a Sub2API \u5e76\u53d1",
-                           font=self._fonts["font_label"], fill=Theme.text_muted)
-            y += 20
-        elif not accounts:
+        if not accounts:
             c.create_text(COL_L + 8, y, anchor="nw", text="\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42",
                            font=self._fonts["font_label"], fill=Theme.text_muted)
             y += 20
@@ -1195,7 +1381,7 @@ class FloatingMonitorApp:
             client_tokens = int(self.state.client_usage.get("tokens") or 0)
             client_requests = int(self.state.client_usage.get("requests") or 0)
             if client_tokens or client_requests:
-                source_text = f"\u542b\u672c\u5730 {compact_number(client_tokens)} tok"
+                source_text = f"\u672c\u5730\u603b\u91cf {compact_number(client_tokens)} tok"
                 c.create_text(COL_R, y + 1, anchor="ne", text=source_text,
                                font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         elif self.state and self.state.usage_note:
@@ -1223,7 +1409,7 @@ class FloatingMonitorApp:
         y += 10
         c.create_text(COL_L, y, anchor="nw", text="Token \u8d8b\u52bf",
                        font=self._fonts["font_section"], fill=Theme.amber)
-        history = (self.state.cost_history if self.state else None) or summarize_usage_history(load_usage_history())
+        history = (self.state.cost_history if self.state else None) or summarize_trend_rows([])
         c.create_text(COL_R, y + 1, anchor="ne",
                        text=f"7\u65e5 {compact_number(history.get('seven_day_tokens', 0))} tok",
                        font=self._fonts["font_tiny"], fill=Theme.text_secondary)
@@ -1278,7 +1464,8 @@ class FloatingMonitorApp:
             (
                 acc
                 for acc in top
-                if str(acc.get("health_badge") or "") == "本地"
+                if str(acc.get("source_badge") or "") == "LOCAL"
+                or str(acc.get("health_badge") or "") == "本地"
                 or str(acc.get("name") or "").lower().startswith("client local")
             ),
             None,
@@ -1291,7 +1478,8 @@ class FloatingMonitorApp:
         max_tokens = max([int(acc.get("tokens") or 0) for acc in top], default=1) or 1
         for index, acc in enumerate(display_top):
             health_badge = str(acc.get("health_badge") or "")
-            name_max_w = 112 if health_badge else 150
+            source_badge = str(acc.get("source_badge") or "")
+            name_max_w = 94 if health_badge and source_badge else (112 if health_badge or source_badge else 150)
             name = self._truncate(acc.get("name", "-"), "font_label", name_max_w)
             tokens = compact_number(acc.get("tokens", 0))
             reqs = compact_number(acc.get("requests", 0))
@@ -1300,8 +1488,12 @@ class FloatingMonitorApp:
 
             c.create_text(COL_L + 8, y, anchor="nw", text=name,
                            font=self._fonts["font_label"], fill=Theme.text_primary)
+            badge_x = COL_L + 12 + self._text_width(name, "font_label")
+            if source_badge:
+                badge_color = Theme.accent_green if source_badge == "LOCAL" else Theme.cyan
+                self._draw_health_badge(badge_x, y + 1, source_badge)
+                badge_x += self._text_width(source_badge, "font_micro") + 18
             if health_badge:
-                badge_x = COL_L + 12 + self._text_width(name, "font_label")
                 self._draw_health_badge(badge_x, y + 1, health_badge)
 
             emphasis = f"{tokens} tok  {cost}"

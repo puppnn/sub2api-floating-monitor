@@ -616,6 +616,33 @@ def load_client_usage() -> dict[str, Any] | None:
     }
 
 
+def latest_request_from_client_providers(providers: list[dict[str, Any]]) -> dict[str, Any]:
+    latest_provider = ""
+    latest_model = ""
+    latest_at = ""
+    latest_dt: datetime | None = None
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        provider_latest_at = str(provider.get("latest_at") or "")
+        provider_dt = _parse_time(provider_latest_at)
+        if provider_dt is None:
+            continue
+        if latest_dt is None or provider_dt > latest_dt:
+            latest_dt = provider_dt
+            latest_provider = str(provider.get("name") or "Local client")
+            latest_model = str(provider.get("latest_model") or "-")
+            latest_at = provider_latest_at
+    if not latest_at:
+        return {}
+    return {
+        "provider": latest_provider,
+        "model": latest_model,
+        "created_at": latest_at,
+        "kind": "success",
+    }
+
+
 def subtract_provider_from_client_usage(client_usage: dict[str, Any] | None, provider_name: str) -> dict[str, Any] | None:
     if not isinstance(client_usage, dict) or not provider_name:
         return client_usage
@@ -646,6 +673,31 @@ def subtract_provider_from_client_usage(client_usage: dict[str, Any] | None, pro
     result["tokens"] = max(0, int(client_usage.get("tokens") or 0) - removed_tokens)
     result["cost"] = max(0.0, float(client_usage.get("cost") or 0) - removed_cost)
     result["sub2api_routed_provider"] = provider_name
+    latest = client_usage.get("latest_request")
+    if isinstance(latest, dict) and str(latest.get("provider") or "") == provider_name:
+        result["latest_request"] = latest_request_from_client_providers(kept)
+    return result
+
+
+def subtract_sub2api_routed_client_usage(client_usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(client_usage, dict):
+        return client_usage
+    providers = client_usage.get("providers")
+    if not isinstance(providers, list):
+        return client_usage
+
+    result = client_usage
+    routed_names = [
+        str(provider.get("name") or "")
+        for provider in providers
+        if isinstance(provider, dict)
+        and (
+            provider.get("routed_to_sub2api") is True
+            or str(provider.get("name") or "").strip().lower() == "codex via sub2api"
+        )
+    ]
+    for name in routed_names:
+        result = subtract_provider_from_client_usage(result, name)
     return result
 
 
@@ -1175,16 +1227,20 @@ class Sub2APIClient:
         points_to_sub2api, _codex_urls = self._codex_points_to_sub2api()
         show_local_activity = include_client_usage and points_to_sub2api is not True
         raw_client_usage = self._load_client_usage_cached() if include_client_usage else None
-        client_usage = raw_client_usage
-        if points_to_sub2api is True and isinstance(raw_client_usage, dict):
-            raw_latest = raw_client_usage.get("latest_request")
+        client_usage = subtract_sub2api_routed_client_usage(raw_client_usage)
+        if (
+            points_to_sub2api is True
+            and isinstance(raw_client_usage, dict)
+            and client_usage is raw_client_usage
+        ):
+            raw_latest = client_usage.get("latest_request") if isinstance(client_usage, dict) else {}
             routed_provider = (
                 str(raw_latest.get("provider") or "")
                 if isinstance(raw_latest, dict)
                 else ""
             )
-            if routed_provider:
-                client_usage = subtract_provider_from_client_usage(raw_client_usage, routed_provider)
+            if routed_provider and routed_provider.lower().startswith("codex local - api-key-"):
+                client_usage = subtract_provider_from_client_usage(client_usage, routed_provider)
         if client_usage and (client_usage["tokens"] or client_usage["requests"] or client_usage["cost"]):
             today_requests = realtime_today_requests + int(client_usage.get("requests") or 0)
             today_tokens = realtime_today_tokens + int(client_usage.get("tokens") or 0)

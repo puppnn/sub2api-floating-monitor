@@ -40,6 +40,8 @@ PROMPT_CACHE_KEY_RE = re.compile(r'prompt_cache_key:\s*Some\(\"(?P<key>[^\"]+)\"
 JSON_PROMPT_CACHE_KEY_RE = re.compile(r'"prompt_cache_key"\s*:\s*"(?P<key>[^"]+)"')
 THREAD_ID_RE = re.compile(r'\bthread\.id=(?P<key>[A-Za-z0-9_-]+)')
 CONVERSATION_ID_RE = re.compile(r'\bconversation\.id=(?P<key>[A-Za-z0-9_-]+)')
+SESSION_LOOP_THREAD_ID_RE = re.compile(r'\bsession_loop\{thread_id=(?P<key>[A-Za-z0-9_-]+)\}')
+SUB2API_ROUTED_CODEX_LABEL = os.environ.get("CLIENT_USAGE_SUB2API_ROUTED_CODEX_LABEL", "Codex via Sub2API")
 
 
 @dataclass
@@ -99,6 +101,9 @@ class UsageEvent:
     output_tokens: int
     app_speed: str = ""
     cost_multiplier: float | None = None
+    session_id: str = ""
+    request_key: str = ""
+    route: str = ""
 
     @property
     def total_tokens(self) -> int:
@@ -117,6 +122,14 @@ class AccountMarker:
 class SpeedMarker:
     when: datetime
     speed: str
+
+
+@dataclass
+class RouteMarker:
+    when: datetime
+    route: str
+    session_id: str = ""
+    request_key: str = ""
 
 
 PRICE_PER_MILLION: list[tuple[str, tuple[float, float, float]]] = [
@@ -193,6 +206,36 @@ def codex_log_request_key(text: str, response: dict[str, Any] | None = None) -> 
     return ""
 
 
+def codex_log_ids(text: str, response: dict[str, Any] | None = None) -> list[str]:
+    keys: list[str] = []
+    if response:
+        for value in (response.get("conversation_id"), response.get("thread_id"), response.get("id")):
+            key = str(value or "").strip()
+            if key and key not in keys:
+                keys.append(key)
+    for pattern in (CONVERSATION_ID_RE, THREAD_ID_RE, SESSION_LOOP_THREAD_ID_RE, PROMPT_CACHE_KEY_RE, JSON_PROMPT_CACHE_KEY_RE):
+        for match in pattern.finditer(text or ""):
+            key = match.group("key").strip()
+            if key and key not in keys:
+                keys.append(key)
+    return keys
+
+
+def detect_codex_route(text: str) -> str:
+    lowered = (text or "").lower()
+    if not lowered:
+        return ""
+    if (
+        "127.0.0.1:8080/v1/responses" in lowered
+        or "localhost:8080/v1/responses" in lowered
+        or "[::1]:8080/v1/responses" in lowered
+    ):
+        return "sub2api"
+    if "chatgpt.com/backend-api/codex" in lowered or "responses_websocket" in lowered:
+        return "official"
+    return ""
+
+
 def codex_model_name(model: str) -> str:
     name = (model or "").strip()
     if not name or name.lower() in {"codex", "unknown"}:
@@ -240,6 +283,9 @@ def make_codex_event(
     when: datetime | None,
     app_speed: str = "",
     cost_multiplier: float | None = None,
+    session_id: str = "",
+    request_key: str = "",
+    route: str = "",
 ) -> UsageEvent | None:
     if when is None:
         return None
@@ -257,6 +303,9 @@ def make_codex_event(
         output_tokens=output,
         app_speed=normalize_codex_speed(app_speed),
         cost_multiplier=cost_multiplier,
+        session_id=str(session_id or "").strip(),
+        request_key=str(request_key or "").strip(),
+        route=str(route or "").strip().lower(),
     )
 
 
@@ -363,6 +412,9 @@ def codex_event_from_log_fields(text: str, ts: Any) -> UsageEvent | None:
     when = parse_dt(fields.get("event.timestamp")) or epoch_to_local_datetime(ts)
     app_speed = codex_service_tier_to_speed(fields.get("service_tier"))
     multiplier = codex_speed_cost_multiplier(app_speed) if app_speed else None
+    request_key = codex_log_request_key(text)
+    ids = codex_log_ids(text)
+    session_id = ids[0] if ids else request_key
     return make_codex_event(
         fields.get("slug") or fields.get("model") or CODEX_DEFAULT_MODEL,
         input_tokens,
@@ -371,6 +423,9 @@ def codex_event_from_log_fields(text: str, ts: Any) -> UsageEvent | None:
         when,
         app_speed,
         multiplier,
+        session_id=session_id,
+        request_key=request_key or session_id,
+        route=detect_codex_route(text),
     )
 
 
@@ -435,6 +490,17 @@ def scan_codex_events(root: Path, start: datetime, end: datetime) -> list[UsageE
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except OSError:
             continue
+        session_id = ""
+        for meta_line in lines[:20]:
+            try:
+                meta_row = json.loads(meta_line)
+            except json.JSONDecodeError:
+                continue
+            if meta_row.get("type") != "session_meta":
+                continue
+            meta_payload = meta_row.get("payload") or {}
+            session_id = str(meta_payload.get("id") or "").strip()
+            break
         fork_replay_cutoff = codex_fork_replay_cutoff(lines)
         for line in lines:
             try:
@@ -499,7 +565,15 @@ def scan_codex_events(root: Path, start: datetime, end: datetime) -> list[UsageE
                 )
                 if event_key not in seen_events:
                     seen_events.add(event_key)
-                    event = make_codex_event(model, input_tokens, cached_tokens, output_tokens, ts)
+                    event = make_codex_event(
+                        model,
+                        input_tokens,
+                        cached_tokens,
+                        output_tokens,
+                        ts,
+                        session_id=session_id,
+                        request_key=session_id,
+                    )
                     if event is not None:
                         events.append(event)
                 last_total = current
@@ -523,12 +597,98 @@ def scan_codex_events(root: Path, start: datetime, end: datetime) -> list[UsageE
             )
             if event_key not in seen_events:
                 seen_events.add(event_key)
-                event = make_codex_event(model, delta_input, delta_cached, delta_output, ts)
+                event = make_codex_event(
+                    model,
+                    delta_input,
+                    delta_cached,
+                    delta_output,
+                    ts,
+                    session_id=session_id,
+                    request_key=session_id,
+                )
                 if event is not None:
                     events.append(event)
             last_total = current
     events.sort(key=lambda event: event.when)
     return events
+
+
+def scan_codex_route_markers(home: Path, start: datetime, end: datetime) -> list[RouteMarker]:
+    db_path = home / ".codex" / "logs_2.sqlite"
+    if not db_path.exists():
+        return []
+
+    start_epoch = int(start.replace(tzinfo=LOCAL_TZ).timestamp()) - 1800
+    end_epoch = int(end.replace(tzinfo=LOCAL_TZ).timestamp()) + 300
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        rows = con.execute(
+            """
+            SELECT ts, feedback_log_body
+            FROM logs
+            WHERE ts >= ?
+              AND ts < ?
+              AND (
+                feedback_log_body LIKE '%/v1/responses%'
+                OR feedback_log_body LIKE '%chatgpt.com/backend-api/codex%'
+                OR feedback_log_body LIKE '%responses_websocket%'
+              )
+            ORDER BY ts ASC, ts_nanos ASC
+            """,
+            (start_epoch, end_epoch),
+        ).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return []
+
+    markers: list[RouteMarker] = []
+    for ts, body in rows:
+        text = str(body or "")
+        route = detect_codex_route(text)
+        if not route:
+            continue
+        when = epoch_to_local_datetime(ts)
+        if when is None:
+            continue
+        ids = codex_log_ids(text)
+        request_key = codex_log_request_key(text)
+        if request_key and request_key not in ids:
+            ids.append(request_key)
+        for key in ids:
+            markers.append(RouteMarker(when=when, route=route, session_id=key, request_key=key))
+    markers.sort(key=lambda marker: marker.when)
+    return markers
+
+
+def apply_codex_route_hints(events: list[UsageEvent], markers: list[RouteMarker]) -> None:
+    if not events or not markers:
+        return
+    by_key: dict[str, list[RouteMarker]] = {}
+    for marker in markers:
+        for key in (marker.session_id, marker.request_key):
+            key = (key or "").strip()
+            if key:
+                by_key.setdefault(key, []).append(marker)
+    marker_times = {
+        key: [marker.when for marker in sorted(value, key=lambda item: item.when)]
+        for key, value in by_key.items()
+    }
+    for key, value in list(by_key.items()):
+        by_key[key] = sorted(value, key=lambda item: item.when)
+
+    for event in events:
+        if event.route:
+            continue
+        candidates = [key for key in (event.session_id, event.request_key) if key]
+        for key in candidates:
+            markers_for_key = by_key.get(key)
+            times_for_key = marker_times.get(key)
+            if not markers_for_key or not times_for_key:
+                continue
+            pos = bisect_right(times_for_key, event.when) - 1
+            if pos >= 0:
+                event.route = markers_for_key[pos].route
+                break
 
 
 def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[UsageEvent]:
@@ -607,6 +767,8 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
             or epoch_to_local_datetime(ts)
         )
         response_key = codex_log_request_key(text, response)
+        ids = codex_log_ids(text, response)
+        session_id = ids[0] if ids else response_key
         app_speed = internal_speed or ""
         if response_key and not app_speed:
             app_speed = speed_by_request.get(response_key, "")
@@ -623,6 +785,9 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
             when,
             app_speed,
             multiplier,
+            session_id=session_id,
+            request_key=response_key or session_id,
+            route=detect_codex_route(text),
         )
         if event is None:
             continue
@@ -646,7 +811,9 @@ def dedupe_usage_events(events: list[UsageEvent]) -> list[UsageEvent]:
         if key in seen:
             existing_idx = seen[key]
             existing = result[existing_idx]
-            if existing.cost_multiplier is None and event.cost_multiplier is not None:
+            existing_score = usage_event_info_score(existing)
+            event_score = usage_event_info_score(event)
+            if event_score > existing_score:
                 result[existing_idx] = event
             continue
         seen[key] = len(result)
@@ -654,9 +821,24 @@ def dedupe_usage_events(events: list[UsageEvent]) -> list[UsageEvent]:
     return result
 
 
+def usage_event_info_score(event: UsageEvent) -> int:
+    score = 0
+    if event.route:
+        score += 8
+    if event.session_id:
+        score += 4
+    if event.request_key:
+        score += 2
+    if event.cost_multiplier is not None:
+        score += 1
+    return score
+
+
 def scan_all_codex_events(home: Path, sessions_root: Path, start: datetime, end: datetime) -> list[UsageEvent]:
     events = scan_codex_events(sessions_root, start, end)
     events.extend(scan_codex_logs2_events(home, start, end))
+    route_markers = scan_codex_route_markers(home, start, end)
+    apply_codex_route_hints(events, route_markers)
     return dedupe_usage_events(events)
 
 
@@ -1567,7 +1749,9 @@ def attribute_codex_events_by_account(
     request_times = [marker.when for marker in request_markers]
     for event in events:
         label = ""
-        if switch_markers:
+        if event.route == "sub2api":
+            label = SUB2API_ROUTED_CODEX_LABEL
+        if not label and switch_markers:
             switch_pos = bisect_right(switch_times, event.when) - 1
             if switch_pos >= 0:
                 label = switch_markers[switch_pos].label
@@ -1652,6 +1836,8 @@ def bucket_to_dict(name: str, bucket: UsageBucket, show_zero: bool = False) -> d
         "latest_model": bucket.latest_model,
         "show_zero": show_zero,
     }
+    if name == SUB2API_ROUTED_CODEX_LABEL:
+        result["routed_to_sub2api"] = True
     if bucket.latest_app_speed:
         result.update(
             {

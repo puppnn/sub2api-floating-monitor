@@ -5,6 +5,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -25,6 +26,9 @@ ENV_FILES = [
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
 REFRESH_SECONDS = 3
 CLIENT_USAGE_CACHE_SECONDS = int(os.environ.get("SUB2API_CLIENT_USAGE_CACHE_SECONDS", "10"))
+CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS = int(os.environ.get("SUB2API_CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS", "15"))
+ACCOUNT_WINDOW_CACHE_SECONDS = int(os.environ.get("SUB2API_ACCOUNT_WINDOW_CACHE_SECONDS", "60"))
+LOCAL_ACTIVE_WINDOW_SECONDS = int(os.environ.get("SUB2API_LOCAL_ACTIVE_WINDOW_SECONDS", "300"))
 CLIENT_USAGE_EXPORT = Path(os.environ.get("CLIENT_USAGE_EXPORT") or APP_DIR / "client_usage_export.py")
 if not CLIENT_USAGE_EXPORT.exists():
     fallback_export = APP_DIR.parent / "client-token-importer" / "client_usage_export.py"
@@ -35,6 +39,7 @@ if not CLIENT_USAGE_JSON.exists():
     fallback_json = APP_DIR.parent / "client-token-importer" / "client_usage_today.json"
     if fallback_json.exists():
         CLIENT_USAGE_JSON = fallback_json
+CLIENT_USAGE_PYTHON = os.environ.get("SUB2API_CLIENT_USAGE_PYTHON") or sys.executable
 USAGE_HISTORY_JSON = Path(os.environ.get("SUB2API_USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
 CN_TZ = timezone(timedelta(hours=8), "CST")
 DISPLAY_TIMEZONE = "Asia/Shanghai"
@@ -229,6 +234,14 @@ def local_provider_display_name(provider_name: str) -> str:
     return name
 
 
+def ranking_account_display_name(account_name: str) -> str:
+    name = (account_name or "-").strip() or "-"
+    for prefix in ("Codex local - ", "Codex OAuth - ", "Relay - "):
+        if name.lower().startswith(prefix.lower()):
+            return name[len(prefix):].strip() or name
+    return name
+
+
 def compact_number(value: float | int | None) -> str:
     number = float(value or 0)
     sign = "-" if number < 0 else ""
@@ -245,6 +258,35 @@ def money(value: float | int | None) -> str:
     if 0 < number < 0.01:
         return f"${number:.6f}"
     return f"${number:.2f}"
+
+
+def quota_color(utilization: float | int | None) -> str:
+    try:
+        value = float(utilization or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value >= 90:
+        return Theme.accent_red
+    if value >= 60:
+        return Theme.amber_bright
+    return Theme.accent_green
+
+
+def quota_reset_text(value: str | None) -> str:
+    target = _parse_time(value)
+    if target is None:
+        return ""
+    seconds = int((target - datetime.now(timezone.utc)).total_seconds())
+    if seconds <= 0:
+        return "\u5f85\u5237\u65b0"
+    minutes = max(1, seconds // 60)
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    if days:
+        return f"{days}d {hours}h \u540e\u91cd\u7f6e"
+    if hours:
+        return f"{hours}h {minutes}m \u540e\u91cd\u7f6e"
+    return f"{minutes}m \u540e\u91cd\u7f6e"
 
 
 def today_key() -> str:
@@ -356,26 +398,19 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
     existing_cost = float(existing.get("cost") or 0)
     existing_tokens = int(existing.get("tokens") or 0)
     existing_requests = int(existing.get("requests") or 0)
-    previous = days.get(date_key(1)) if isinstance(days.get(date_key(1)), dict) else {}
-    existing_matches_previous_day = (
-        bool(previous)
-        and existing_requests == int(previous.get("requests") or 0)
-        and existing_tokens == int(previous.get("tokens") or 0)
-        and round(existing_cost, 6) == round(float(previous.get("cost") or 0), 6)
-        and (new_cost or new_tokens or new_requests)
-    )
+    source_date = ""
+    if isinstance(state.client_usage, dict):
+        source_date = str(state.client_usage.get("date") or "").strip()
+    existing_source_date = str(existing.get("source_date") or "").strip()
 
-    # The local clients expose usage as reconstructed snapshots, not an
-    # append-only ledger. Session cleanup, recovery, or a temporary dashboard
-    # read can make a later snapshot smaller, so keep the daily high-water mark.
-    use_high_water = state.usage_source in {"local", "client", "local-codex", "both"}
-    if use_high_water and (existing_cost or existing_tokens or existing_requests) and not existing_matches_previous_day:
-        new_cost = max(new_cost, existing_cost)
-        new_tokens = max(new_tokens, existing_tokens)
-        new_requests = max(new_requests, existing_requests)
-        state.today_account_cost = new_cost
-        state.today_tokens = new_tokens
-        state.today_requests = new_requests
+    # Same-day usage is cumulative. A sharp drop usually means a transient
+    # exporter/API failure or a source switch, so keep the higher observed
+    # counters instead of letting a partial refresh erase the day.
+    if existing_source_date in {"", source_date, key}:
+        if existing_tokens > new_tokens and existing_tokens >= max(1, int(new_tokens * 1.05)):
+            new_tokens = existing_tokens
+            new_requests = max(new_requests, existing_requests)
+            new_cost = max(new_cost, existing_cost)
 
     days[key] = {
         "date": key,
@@ -384,6 +419,7 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
         "tokens": new_tokens,
         "cost": round(new_cost, 6),
         "updated_at": datetime.now(CN_TZ).isoformat(timespec="seconds"),
+        "source_date": source_date,
     }
     try:
         USAGE_HISTORY_JSON.parent.mkdir(parents=True, exist_ok=True)
@@ -428,6 +464,49 @@ def _parse_time(value: str | None) -> datetime | None:
         return None
 
 
+def is_recent_activity(value: str | None, window_seconds: int = LOCAL_ACTIVE_WINDOW_SECONDS) -> bool:
+    dt = _parse_time(value)
+    if dt is None:
+        return False
+    seconds = (datetime.now(timezone.utc) - dt).total_seconds()
+    return 0 <= seconds <= max(1, window_seconds)
+
+
+def local_active_accounts_from_client_usage(
+    client_usage: dict[str, Any] | None,
+    *,
+    include_when_routed_to_sub2api: bool = True,
+) -> list[dict[str, Any]]:
+    if not include_when_routed_to_sub2api:
+        return []
+    if not isinstance(client_usage, dict):
+        return []
+    client_latest = client_usage.get("latest_request")
+    if not isinstance(client_latest, dict) or not client_latest.get("created_at"):
+        return []
+    if not is_recent_activity(str(client_latest.get("created_at") or "")):
+        return []
+
+    providers = client_usage.get("providers")
+    providers = providers if isinstance(providers, list) else []
+    provider_name = str(client_latest.get("provider") or "Local client")
+    latest_provider = next(
+        (provider for provider in providers if isinstance(provider, dict) and str(provider.get("name") or "") == provider_name),
+        {},
+    )
+    return [
+        {
+            "id": "local",
+            "name": f"LOCAL - {local_provider_display_name(provider_name)}",
+            "current": 1,
+            "max": 1,
+            "model": client_latest.get("model") or "-",
+            "source": "LOCAL",
+            "speed_badge": latest_provider.get("speed_badge") or "",
+        }
+    ]
+
+
 def account_health_badge(account: dict[str, Any]) -> str:
     """Return a short account health label for the ranking list."""
     status = str(account.get("status") or "").strip().lower()
@@ -448,15 +527,52 @@ def account_health_badge(account: dict[str, Any]) -> str:
     return ""
 
 
+def account_has_email(account: dict[str, Any]) -> bool:
+    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
+    credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
+    candidates = (
+        account.get("name"),
+        extra.get("email_address"),
+        extra.get("email"),
+        credentials.get("email"),
+    )
+    return any("@" in str(value or "") for value in candidates)
+
+
+def normalize_usage_window(progress: Any) -> dict[str, Any]:
+    if not isinstance(progress, dict):
+        return {}
+    stats = progress.get("window_stats")
+    if not isinstance(stats, dict):
+        return {}
+    utilization = progress.get("utilization")
+    result = {
+        "requests": int(stats.get("requests") or 0),
+        "tokens": int(stats.get("tokens") or 0),
+        "cost": float(stats.get("cost") or 0),
+        "resets_at": str(progress.get("resets_at") or ""),
+        "quota_available": utilization is not None,
+        "quota_stale": False,
+    }
+    if utilization is not None:
+        try:
+            used = float(utilization)
+            result["utilization"] = used
+            result["remaining_percent"] = max(0.0, min(100.0, 100.0 - used))
+        except (TypeError, ValueError):
+            result["quota_available"] = False
+    return result
+
+
 def load_client_usage() -> dict[str, Any] | None:
     if CLIENT_USAGE_EXPORT.exists():
         try:
             subprocess.run(
-                ["python", str(CLIENT_USAGE_EXPORT), "--output", str(CLIENT_USAGE_JSON)],
+                [CLIENT_USAGE_PYTHON, str(CLIENT_USAGE_EXPORT), "--output", str(CLIENT_USAGE_JSON)],
                 cwd=str(APP_DIR),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=8,
+                timeout=CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -471,6 +587,18 @@ def load_client_usage() -> dict[str, Any] | None:
     today = data.get("today") if isinstance(data, dict) else None
     if not isinstance(today, dict):
         return None
+    data_date = str(data.get("date") or "").strip()
+    if data_date and data_date != today_key():
+        return {
+            "requests": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "providers": [],
+            "latest_request": {},
+            "updated_at": data.get("updated_at") or "",
+            "date": data_date,
+            "stale": True,
+        }
     return {
         "requests": int(today.get("requests") or 0),
         "tokens": int(today.get("tokens") or 0),
@@ -478,7 +606,42 @@ def load_client_usage() -> dict[str, Any] | None:
         "providers": data.get("providers") or [],
         "latest_request": data.get("latest_request") or {},
         "updated_at": data.get("updated_at") or "",
+        "date": data_date,
+        "stale": False,
     }
+
+
+def subtract_provider_from_client_usage(client_usage: dict[str, Any] | None, provider_name: str) -> dict[str, Any] | None:
+    if not isinstance(client_usage, dict) or not provider_name:
+        return client_usage
+    providers = client_usage.get("providers")
+    if not isinstance(providers, list):
+        return client_usage
+
+    kept: list[dict[str, Any]] = []
+    removed_requests = 0
+    removed_tokens = 0
+    removed_cost = 0.0
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        if str(provider.get("name") or "") == provider_name:
+            removed_requests += int(provider.get("requests") or 0)
+            removed_tokens += int(provider.get("tokens") or 0)
+            removed_cost += float(provider.get("cost") or 0)
+            continue
+        kept.append(provider)
+
+    if removed_requests <= 0 and removed_tokens <= 0 and removed_cost <= 0:
+        return client_usage
+
+    result = dict(client_usage)
+    result["providers"] = kept
+    result["requests"] = max(0, int(client_usage.get("requests") or 0) - removed_requests)
+    result["tokens"] = max(0, int(client_usage.get("tokens") or 0) - removed_tokens)
+    result["cost"] = max(0.0, float(client_usage.get("cost") or 0) - removed_cost)
+    result["sub2api_routed_provider"] = provider_name
+    return result
 
 
 def local_usage_from_providers(client_usage: dict[str, Any] | None, prefixes: tuple[str, ...]) -> dict[str, Any] | None:
@@ -615,6 +778,12 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
                     "cost": float(provider.get("cost") or 0),
                     "health_badge": "",
                     "source_badge": "LOCAL",
+                    "app_speed": provider.get("app_speed") or "",
+                    "cost_multiplier": provider.get("cost_multiplier") or 1,
+                    "speed_badge": provider.get("speed_badge") or "",
+                    "window_5h": provider.get("window_5h") or {},
+                    "window_7d": provider.get("window_7d") or {},
+                    "window_cycle": provider.get("window_cycle") or {},
                 }
             )
     top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
@@ -623,15 +792,33 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
     client_latest = client_usage.get("latest_request") if isinstance(client_usage, dict) else {}
     latest_request = None
     latest_account_name = "Local client logs"
+    active_accounts: list[dict[str, Any]] = []
     if isinstance(client_latest, dict) and client_latest.get("created_at"):
         provider_name = str(client_latest.get("provider") or "Local client")
+        latest_provider = next(
+            (provider for provider in providers if isinstance(provider, dict) and str(provider.get("name") or "") == provider_name),
+            {},
+        )
         latest_request = {
             "kind": client_latest.get("kind") or "success",
             "model": client_latest.get("model") or "-",
             "created_at": client_latest.get("created_at"),
             "source": "LOCAL",
+            "speed_badge": latest_provider.get("speed_badge") or "",
         }
         latest_account_name = f"LOCAL - {local_provider_display_name(provider_name)}"
+        if is_recent_activity(str(client_latest.get("created_at") or "")):
+            active_accounts.append(
+                {
+                    "id": "local",
+                    "name": latest_account_name,
+                    "current": 1,
+                    "max": 1,
+                    "model": client_latest.get("model") or "-",
+                    "source": "LOCAL",
+                    "speed_badge": latest_provider.get("speed_badge") or "",
+                }
+            )
     elif updated_at:
         latest_request = {
             "kind": "success",
@@ -639,7 +826,19 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
             "created_at": updated_at,
             "source": "LOCAL",
         }
+        if is_recent_activity(str(updated_at)):
+            active_accounts.append(
+                {
+                    "id": "local",
+                    "name": latest_account_name,
+                    "current": 1,
+                    "max": 1,
+                    "model": "local-codex",
+                    "source": "LOCAL",
+                }
+            )
 
+    active_accounts = local_active_accounts_from_client_usage(client_usage)
     return MonitorState(
         loading=False,
         error=error_text,
@@ -648,7 +847,7 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
         source_label="LOCAL-CODEX",
         usage_source="local",
         usage_note=usage_note,
-        active_accounts=[],
+        active_accounts=active_accounts,
         latest_request=latest_request,
         latest_account_name=latest_account_name,
         today_requests=int(client_usage.get("requests") or 0),
@@ -704,6 +903,7 @@ class Sub2APIClient:
         self.token: str | None = None
         self._client_usage_cache: dict[str, Any] | None = None
         self._client_usage_cache_at: float = 0.0
+        self._account_window_cache: dict[int, tuple[float, dict[str, Any]]] = {}
 
     def _sub2api_match_urls(self) -> list[str]:
         env = read_env_files(ENV_FILES)
@@ -759,6 +959,28 @@ class Sub2APIClient:
     def clear_client_usage_cache(self) -> None:
         self._client_usage_cache = None
         self._client_usage_cache_at = 0.0
+
+    def _load_account_windows_cached(self, account: dict[str, Any]) -> dict[str, Any]:
+        account_id = int(account.get("id") or 0)
+        if account_id <= 0 or not account_has_email(account) or str(account.get("type") or "").lower() != "oauth":
+            return {}
+
+        now = time.time()
+        cached = self._account_window_cache.get(account_id)
+        if cached and now - cached[0] < ACCOUNT_WINDOW_CACHE_SECONDS:
+            return cached[1]
+
+        try:
+            usage = self._request("GET", f"/api/v1/admin/accounts/{account_id}/usage") or {}
+            result = {
+                "window_5h": normalize_usage_window(usage.get("five_hour")),
+                "window_7d": normalize_usage_window(usage.get("seven_day")),
+                "window_cycle": normalize_usage_window(usage.get("cycle") or usage.get("primary_window")),
+            }
+            self._account_window_cache[account_id] = (now, result)
+            return result
+        except Exception:
+            return cached[1] if cached else {}
 
     def _request(
         self,
@@ -923,6 +1145,7 @@ class Sub2APIClient:
         for account in accounts:
             account_id = int(account.get("id") or 0)
             account_stats = today_by_account.get(str(account_id)) or {}
+            account_windows = self._load_account_windows_cached(account)
             tokens = int(account_stats.get("tokens") or 0)
             requests_count = int(account_stats.get("requests") or 0)
             cost = float(account_stats.get("cost") or 0)
@@ -937,17 +1160,32 @@ class Sub2APIClient:
                     "cost": cost,
                     "health_badge": account_health_badge(account),
                     "source_badge": "SUB",
+                    "window_5h": account_windows.get("window_5h") or {},
+                    "window_7d": account_windows.get("window_7d") or {},
+                    "window_cycle": account_windows.get("window_cycle") or {},
                 }
             )
         top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
-        raw_client_usage = self._load_client_usage_cached()
+        include_client_usage = self._should_include_client_usage(resolved_source)
+        points_to_sub2api, _codex_urls = self._codex_points_to_sub2api()
+        show_local_activity = include_client_usage and points_to_sub2api is not True
+        raw_client_usage = self._load_client_usage_cached() if include_client_usage else None
         client_usage = raw_client_usage
+        if points_to_sub2api is True and isinstance(raw_client_usage, dict):
+            raw_latest = raw_client_usage.get("latest_request")
+            routed_provider = (
+                str(raw_latest.get("provider") or "")
+                if isinstance(raw_latest, dict)
+                else ""
+            )
+            if routed_provider:
+                client_usage = subtract_provider_from_client_usage(raw_client_usage, routed_provider)
         if client_usage and (client_usage["tokens"] or client_usage["requests"] or client_usage["cost"]):
-            today_requests = int(client_usage.get("requests") or 0)
-            today_tokens = int(client_usage.get("tokens") or 0)
-            today_account_cost = float(client_usage.get("cost") or 0)
-            ledger_source = "local"
-            ledger_note = f"{usage_note} / 本地日志总量 + Sub2API账号拆分"
+            today_requests = realtime_today_requests + int(client_usage.get("requests") or 0)
+            today_tokens = realtime_today_tokens + int(client_usage.get("tokens") or 0)
+            today_account_cost = realtime_today_cost + float(client_usage.get("cost") or 0)
+            ledger_source = "both"
+            ledger_note = f"{usage_note} / Sub2API + 本地日志"
         else:
             today_requests = int(stats.get("today_requests") or realtime_today_requests)
             today_tokens = int(stats.get("today_tokens") or realtime_today_tokens)
@@ -978,6 +1216,12 @@ class Sub2APIClient:
                         "cost": provider_cost,
                         "health_badge": "",
                         "source_badge": "LOCAL",
+                        "app_speed": provider.get("app_speed") or "",
+                        "cost_multiplier": provider.get("cost_multiplier") or 1,
+                        "speed_badge": provider.get("speed_badge") or "",
+                        "window_5h": provider.get("window_5h") or {},
+                        "window_7d": provider.get("window_7d") or {},
+                        "window_cycle": provider.get("window_cycle") or {},
                     }
                 )
             top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
@@ -985,19 +1229,35 @@ class Sub2APIClient:
         display_latest = latest
         display_latest_account_name = latest_account_name
         client_latest = client_usage.get("latest_request") if isinstance(client_usage, dict) else {}
-        if isinstance(client_latest, dict) and client_latest.get("created_at"):
+        if show_local_activity and isinstance(client_latest, dict) and client_latest.get("created_at"):
             provider_name = str(client_latest.get("provider") or "Local client")
+            latest_provider = next(
+                (provider for provider in providers if isinstance(provider, dict) and str(provider.get("name") or "") == provider_name),
+                {},
+            )
             local_latest = {
                 "kind": client_latest.get("kind") or "success",
                 "model": client_latest.get("model") or "-",
                 "created_at": client_latest.get("created_at"),
                 "source": "LOCAL",
+                "speed_badge": latest_provider.get("speed_badge") or "",
             }
             local_dt = _parse_time(str(client_latest.get("created_at") or ""))
             sub_dt = _parse_time(str(latest.get("created_at") or "")) if isinstance(latest, dict) else None
             if sub_dt is None or (local_dt is not None and local_dt >= sub_dt):
                 display_latest = local_latest
                 display_latest_account_name = f"LOCAL - {local_provider_display_name(provider_name)}"
+
+        for local_active in local_active_accounts_from_client_usage(
+            client_usage,
+            include_when_routed_to_sub2api=show_local_activity,
+        ):
+            local_name = str(local_active.get("name") or "")
+            if not any(str(account.get("name") or "") == local_name for account in active_accounts):
+                active_accounts.append(local_active)
+        active_accounts.sort(
+            key=lambda row: (-int(row.get("current") or 0), str(row.get("id") or ""), str(row.get("name") or ""))
+        )
 
         return MonitorState(
             loading=False,
@@ -1049,6 +1309,9 @@ class Theme:
     accent_cyan = "#66D9E8"
     accent_red = "#F07178"
     accent_green = "#8BD17C"
+    quota_red_bg = "#34131D"
+    quota_amber_bg = "#33240E"
+    quota_green_bg = "#10251A"
 
     # ── misc ──
     border = "#2A2D35"
@@ -1091,6 +1354,9 @@ class FloatingMonitorApp:
         self._resizing = False
         self._hover_btn: str | None = None
         self._btn_rects: dict[str, tuple[int, int, int, int]] = {}
+        self._account_range = "today"
+        self._account_range_user_selected = False
+        self._account_range_auto_selected = False
         self._topmost_repair_scheduled = False
 
         # ── root window ──
@@ -1234,10 +1500,12 @@ class FloatingMonitorApp:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _health_color(self, label: str) -> str:
-        if label == "LOCAL":
+        if label in {"LOCAL", "\u672c\u5730"}:
             return Theme.accent_green
-        if label == "SUB":
+        if label in {"SUB", "SUB2"}:
             return Theme.cyan
+        if label.upper().startswith("FAST"):
+            return Theme.amber_bright
         if label in {"\u9650\u989d", "\u9650\u6d41", "\u51b7\u5374"}:
             return Theme.amber_bright
         if label in {"\u4e0d\u53ef\u7528", "\u505c\u7528", "\u9519\u8bef"}:
@@ -1286,13 +1554,13 @@ class FloatingMonitorApp:
         elif self.state:
             c.create_oval(COL_R - 78, y + 5, COL_R - 68, y + 15, fill=Theme.accent_green, outline="")
 
-        active_count = len(self.state.active_accounts or []) if self.state and self.state.mode == "sub2api" else 0
+        active_count = len(self.state.active_accounts or []) if self.state else 0
         updated = "\u8bfb\u53d6\u4e2d" if self._loading else "\u7b49\u5f85\u5237\u65b0"
         if self.state and self.state.updated_at:
             updated = relative_time(datetime.fromtimestamp(self.state.updated_at, timezone.utc).isoformat())
         subtitle = f"\u6d3b\u8dc3 {active_count}  /  {updated}"
         if self.state and self.state.mode == "local-codex":
-            subtitle = f"\u672c\u5730\u6a21\u5f0f  /  {updated}"
+            subtitle = f"\u6d3b\u8dc3 {active_count}  /  {updated}"
         c.create_text(COL_L, y + 24, anchor="nw", text=subtitle,
                       font=self._fonts["font_micro"], fill=Theme.text_muted)
 
@@ -1385,6 +1653,9 @@ class FloatingMonitorApp:
             req = self.state.latest_request
             kind = req.get("kind", "-")
             model = req.get("model", "-")
+            speed_badge = str(req.get("speed_badge") or "")
+            if speed_badge:
+                model = f"{model} / {speed_badge}"
             created = req.get("created_at", "")
             acct = self.state.latest_account_name or "-"
             status_text = "\u9519\u8bef" if kind == "error" else ("\u6210\u529f" if kind else "-")
@@ -1489,69 +1760,231 @@ class FloatingMonitorApp:
         # ════════════════════════════════════════════════════════
         #  TOP ACCOUNTS
         # ════════════════════════════════════════════════════════
-        y += 10
-        c.create_text(COL_L, y, anchor="nw", text="\u8d26\u53f7\u6392\u884c",
-                       font=self._fonts["font_section"], fill=Theme.amber)
-        y += 20
+        raw_top = list(self.state.top_accounts or []) if self.state else []
+        range_key = {"5h": "window_5h", "7d": "window_7d", "cycle": "window_cycle"}.get(self._account_range)
+        range_label = {
+            "today": "\u4eca\u65e5",
+            "5h": "\u6700\u8fd1 5 \u5c0f\u65f6",
+            "7d": "\u6700\u8fd1 7 \u5929",
+            "cycle": "\u5468\u671f",
+        }.get(self._account_range, "\u4eca\u65e5")
+        if range_key:
+            top = []
+            for account in raw_top:
+                window = account.get(range_key)
+                if not isinstance(window, dict) or not window:
+                    continue
+                window_tokens = int(window.get("tokens") or 0)
+                window_requests = int(window.get("requests") or 0)
+                window_cost = float(window.get("cost") or 0)
+                has_quota = bool(window.get("quota_available", window.get("utilization") is not None))
+                if window_tokens <= 0 and window_requests <= 0 and window_cost <= 0 and not has_quota:
+                    continue
+                item = dict(account)
+                item["tokens"] = window_tokens
+                item["requests"] = window_requests
+                item["cost"] = window_cost
+                item["utilization"] = window.get("utilization")
+                item["remaining_percent"] = window.get("remaining_percent")
+                item["resets_at"] = str(window.get("resets_at") or "")
+                item["quota_available"] = has_quota
+                item["quota_stale"] = bool(window.get("quota_stale"))
+                top.append(item)
+            top.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
+        else:
+            top = raw_top
 
-        top = self.state.top_accounts if self.state else []
+        y += 9
+        c.create_text(COL_L, y + 2, anchor="nw", text="\u8d26\u53f7\u7528\u91cf",
+                       font=self._fonts["font_section"], fill=Theme.amber)
+        c.create_text(COL_L + 67, y + 5, anchor="nw", text=f"{len(top)} \u4e2a\u8d26\u53f7",
+                      font=self._fonts["font_micro"], fill=Theme.text_muted)
+
+        tab_specs = [
+            ("rank_today", "\u4eca\u65e5", "today"),
+            ("rank_5h", "\u8fd1 5 \u5c0f\u65f6", "5h"),
+            ("rank_7d", "\u8fd1 7 \u5929", "7d"),
+            ("rank_cycle", "\u5468\u671f", "cycle"),
+        ]
+        tab_w = 52
+        tab_gap = 3
+        tab_h = 21
+        tabs_x = COL_R - (tab_w * len(tab_specs) + tab_gap * (len(tab_specs) - 1))
+        for tab_index, (button_name, label, value) in enumerate(tab_specs):
+            x1 = tabs_x + tab_index * (tab_w + tab_gap)
+            x2 = x1 + tab_w
+            self._btn_rects[button_name] = (x1, y - 1, x2, y - 1 + tab_h)
+            selected = self._account_range == value
+            hovered = self._hover_btn == button_name
+            fill = Theme.bg_lift if selected else (Theme.bg_hover if hovered else Theme.bg_dark)
+            outline = Theme.amber_dim if selected else Theme.border
+            text_color = Theme.amber_bright if selected else (Theme.text_primary if hovered else Theme.text_secondary)
+            self._draw_rounded_rect(x1, y - 1, x2, y - 1 + tab_h, r=6, fill=fill, outline=outline, width=1)
+            c.create_text((x1 + x2) // 2, y + 9, anchor="center", text=label,
+                          font=self._fonts["font_micro"], fill=text_color)
+        y += 27
+
         if not top:
-            c.create_text(COL_L + 8, y, anchor="nw", text="\u6682\u65e0\u7528\u91cf",
-                           font=self._fonts["font_label"], fill=Theme.text_muted)
-        available_rank_rows = max(1, (H - 44 - y) // 30)
-        max_rank_rows = min(len(top), max(3, available_rank_rows))
+            empty_text = "\u8be5\u65f6\u95f4\u8303\u56f4\u6682\u65e0\u8d26\u53f7\u8bb0\u5f55" if range_key else "\u6682\u65e0\u7528\u91cf"
+            c.create_text(COL_L + 8, y, anchor="nw", text=empty_text,
+                          font=self._fonts["font_label"], fill=Theme.text_muted)
+        window_mode = bool(range_key)
+        row_h = 50 if window_mode else 29
+        available_rank_rows = max(1, (H - 44 - y) // row_h)
+        max_rank_rows = min(len(top), available_rank_rows)
         display_top = list(top[:max_rank_rows])
-        local_account = next(
-            (
-                acc
-                for acc in top
-                if str(acc.get("source_badge") or "") == "LOCAL"
-                or str(acc.get("health_badge") or "") == "本地"
-                or str(acc.get("name") or "").lower().startswith("client local")
-            ),
-            None,
-        )
-        if local_account and local_account not in display_top:
-            if display_top:
-                display_top[-1] = local_account
-            else:
-                display_top = [local_account]
-        max_tokens = max([int(acc.get("tokens") or 0) for acc in top], default=1) or 1
         for index, acc in enumerate(display_top):
             health_badge = str(acc.get("health_badge") or "")
             source_badge = str(acc.get("source_badge") or "")
-            name_max_w = 94 if health_badge and source_badge else (112 if health_badge or source_badge else 150)
-            name = self._truncate(acc.get("name", "-"), "font_label", name_max_w)
+            speed_badge = str(acc.get("speed_badge") or "")
+            source_label = "\u672c\u5730" if source_badge == "LOCAL" else ("SUB2" if source_badge == "SUB" else source_badge)
+            source_w = self._text_width(source_label, "font_micro") + 14 if source_label else 0
+            speed_w = self._text_width(speed_badge, "font_micro") + 14 if speed_badge else 0
+            badges_w = (source_w + 7 if source_label else 0) + (speed_w + 7 if speed_badge else 0)
+            name_x = COL_L + 8 + badges_w
+            metric_start_x = COL_R - (76 if window_mode else 150)
+            name_max_w = max(60, metric_start_x - name_x - 6)
+            name = self._truncate(
+                ranking_account_display_name(str(acc.get("name") or "-")),
+                "font_label",
+                name_max_w,
+            )
             tokens = compact_number(acc.get("tokens", 0))
             reqs = compact_number(acc.get("requests", 0))
             cost = money(acc.get("cost", 0))
-            bar_color = Theme.amber if index == 0 else (Theme.cyan if index == 1 else (Theme.violet if index == 2 else Theme.blue))
+            utilization = acc.get("utilization")
+            remaining_percent = acc.get("remaining_percent")
+            if remaining_percent is None and utilization is not None:
+                try:
+                    remaining_percent = max(0.0, min(100.0, 100.0 - float(utilization)))
+                except (TypeError, ValueError):
+                    remaining_percent = None
+            quota_available = bool(acc.get("quota_available")) if window_mode else False
+            quota_stale = bool(acc.get("quota_stale")) if window_mode else False
+            cycle_window = acc.get("window_cycle") if isinstance(acc.get("window_cycle"), dict) else {}
+            has_cycle_quota = bool(cycle_window.get("quota_available"))
+            if window_mode and quota_available:
+                bar_color = quota_color(utilization)
+            else:
+                bar_color = Theme.amber if index == 0 else (Theme.cyan if index == 1 else (Theme.violet if index == 2 else Theme.blue))
 
-            c.create_text(COL_L + 8, y, anchor="nw", text=name,
-                           font=self._fonts["font_label"], fill=Theme.text_primary)
-            badge_x = COL_L + 12 + self._text_width(name, "font_label")
-            if source_badge:
-                badge_color = Theme.accent_green if source_badge == "LOCAL" else Theme.cyan
-                self._draw_health_badge(badge_x, y + 1, source_badge)
-                badge_x += self._text_width(source_badge, "font_micro") + 18
-            if health_badge:
-                self._draw_health_badge(badge_x, y + 1, health_badge)
+            marker_bottom = y + (42 if window_mode else 23)
+            c.create_rectangle(COL_L, y + 2, COL_L + 3, marker_bottom, fill=bar_color, outline="")
+            if source_label:
+                self._draw_health_badge(COL_L + 8, y + 1, source_label)
+            if speed_badge:
+                speed_x = COL_L + 8 + (source_w + 4 if source_label else 0)
+                self._draw_health_badge(speed_x, y + 1, speed_badge)
+            c.create_text(name_x, y, anchor="nw", text=name,
+                          font=self._fonts["font_label"], fill=Theme.text_primary)
 
-            emphasis = f"{tokens} tok  {cost}"
-            req_text = f"{reqs} req"
-            c.create_text(COL_R - 4, y, anchor="ne", text=emphasis,
-                           font=self._fonts["font_label_bold"], fill=bar_color)
-            emphasis_w = self._text_width(emphasis, "font_label_bold")
-            c.create_text(COL_R - 12 - emphasis_w, y + 1, anchor="ne", text=req_text,
-                           font=self._fonts["font_tiny"], fill=Theme.text_secondary)
-            bar_y = y + 20
-            bar_x1 = COL_L + 8
-            bar_x2 = COL_R - 4
-            self._draw_rounded_rect(bar_x1, bar_y, bar_x2, bar_y + 6, r=3, fill=Theme.bg_dark, outline="")
-            tokens_raw = int(acc.get("tokens") or 0)
-            fill_w = int((bar_x2 - bar_x1) * max(0.04, min(1.0, tokens_raw / max_tokens)))
-            self._draw_rounded_rect(bar_x1, bar_y, bar_x1 + fill_w, bar_y + 6, r=3, fill=bar_color, outline="")
-            y += 30
+            if window_mode:
+                if quota_available:
+                    try:
+                        percent_value = float(utilization)
+                        percentage_text = f"\u5df2\u7528 {percent_value:.0f}%"
+                    except (TypeError, ValueError):
+                        percentage_text = "--%"
+                elif has_cycle_quota and self._account_range in {"5h", "7d"}:
+                    percentage_text = "\u5468\u671f\u8d26\u53f7"
+                else:
+                    percentage_text = "\u6682\u65e0\u989d\u5ea6"
+                percentage_color = Theme.text_muted if quota_stale or not quota_available else bar_color
+                if has_cycle_quota and not quota_available and self._account_range in {"5h", "7d"}:
+                    percentage_color = Theme.amber_bright
+                if quota_stale or not quota_available:
+                    percentage_fill = Theme.bg_lift
+                    percentage_outline = Theme.border
+                elif percentage_color == Theme.accent_red:
+                    percentage_fill = Theme.quota_red_bg
+                    percentage_outline = Theme.accent_red
+                elif percentage_color == Theme.amber_bright:
+                    percentage_fill = Theme.quota_amber_bg
+                    percentage_outline = Theme.amber_bright
+                else:
+                    percentage_fill = Theme.quota_green_bg
+                    percentage_outline = Theme.accent_green
+                pill_w = self._text_width(percentage_text, "font_label_bold") + 15
+                pill_x1 = COL_R - max(56, pill_w)
+                pill_x2 = COL_R - 2
+                self._draw_rounded_rect(pill_x1, y - 2, pill_x2, y + 18,
+                                        r=6, fill=percentage_fill, outline=percentage_outline, width=1)
+                c.create_text((pill_x1 + pill_x2) // 2, y + 8, anchor="center", text=percentage_text,
+                              font=self._fonts["font_label_bold"], fill=percentage_color)
+
+                metric_text = f"{tokens} Token  \u00b7  {cost}"
+                c.create_text(name_x, y + 20, anchor="nw", text=metric_text,
+                              font=self._fonts["font_label_bold"], fill=Theme.cyan)
+                if health_badge:
+                    right_detail = health_badge
+                    right_color = self._health_color(health_badge)
+                elif quota_stale:
+                    right_detail = "\u989d\u5ea6\u5f85\u5237\u65b0"
+                    right_color = Theme.amber_bright
+                elif has_cycle_quota and not quota_available and self._account_range in {"5h", "7d"}:
+                    right_detail = "\u770b\u5468\u671f\u9875"
+                    right_color = Theme.amber_bright
+                elif not quota_available:
+                    right_detail = "\u65e0\u8be5\u7a97\u53e3\u989d\u5ea6"
+                    right_color = Theme.text_muted
+                else:
+                    try:
+                        remaining_text = f"{float(remaining_percent):.0f}%"
+                    except (TypeError, ValueError):
+                        remaining_text = "--%"
+                    right_detail = f"\u5269\u4f59 {remaining_text} \u00b7 {reqs} \u6b21"
+                    right_color = Theme.text_muted
+                c.create_text(COL_R - 4, y + 20, anchor="ne", text=right_detail,
+                              font=self._fonts["font_micro"], fill=right_color)
+
+                if quota_available:
+                    reset_text = quota_reset_text(str(acc.get("resets_at") or ""))
+                    if self._account_range == "7d" and reset_text:
+                        reset_text = f"\u5468\u9650\u989d \u00b7 {reset_text}"
+                    elif self._account_range == "cycle" and reset_text:
+                        reset_text = f"\u5468\u671f \u00b7 {reset_text}"
+                    elif self._account_range == "5h" and reset_text:
+                        reset_text = f"5h \u9650\u989d \u00b7 {reset_text}"
+                elif self._account_range == "7d":
+                    reset_text = "\u8be5\u8d26\u53f7\u4f7f\u7528\u5468\u671f\u989d\u5ea6" if has_cycle_quota else "\u672a\u63d0\u4f9b\u5468\u989d\u5ea6"
+                elif self._account_range == "cycle":
+                    reset_text = "\u672a\u63d0\u4f9b\u5468\u671f\u989d\u5ea6"
+                else:
+                    reset_text = "\u6682\u65e0\u989d\u5ea6\u6570\u636e"
+                reset_w = self._text_width(reset_text, "font_micro") if reset_text else 0
+                progress_x1 = name_x
+                progress_x2 = max(progress_x1 + 42, COL_R - reset_w - 14)
+                progress_y = y + 41
+                self._draw_rounded_rect(progress_x1, progress_y, progress_x2, progress_y + 4,
+                                        r=2, fill=Theme.bg_lift, outline="")
+                if quota_available:
+                    try:
+                        ratio = max(0.0, min(1.0, float(utilization) / 100.0))
+                    except (TypeError, ValueError):
+                        ratio = 0.0
+                    if ratio > 0:
+                        fill_x2 = progress_x1 + max(3, int((progress_x2 - progress_x1) * ratio))
+                        self._draw_rounded_rect(progress_x1, progress_y, fill_x2, progress_y + 4,
+                                                r=2, fill=bar_color, outline="")
+                if reset_text:
+                    c.create_text(COL_R - 4, y + 33, anchor="ne", text=reset_text,
+                                  font=self._fonts["font_micro"], fill=Theme.text_muted)
+                c.create_line(COL_L + 8, y + 48, COL_R - 4, y + 48, fill=Theme.border, width=1)
+            else:
+                cost_w = self._text_width(cost, "font_label_bold")
+                c.create_text(COL_R - 4, y, anchor="ne", text=cost,
+                              font=self._fonts["font_label_bold"], fill=Theme.amber_bright)
+                c.create_text(COL_R - 12 - cost_w, y, anchor="ne", text=f"{tokens} Token",
+                              font=self._fonts["font_label_bold"], fill=bar_color)
+
+                detail_text = f"{range_label}  \u00b7  {reqs} \u6b21\u8bf7\u6c42"
+                c.create_text(name_x, y + 15, anchor="nw", text=detail_text,
+                              font=self._fonts["font_micro"], fill=Theme.text_muted)
+                if health_badge:
+                    c.create_text(COL_R - 4, y + 15, anchor="ne", text=health_badge,
+                                  font=self._fonts["font_micro"], fill=self._health_color(health_badge))
+                c.create_line(COL_L + 8, y + 27, COL_R - 4, y + 27, fill=Theme.border, width=1)
+            y += row_h
 
         # ── footer timestamp ──
         now_str = datetime.now(CN_TZ).strftime("%H:%M:%S UTC+8")
@@ -1608,6 +2041,16 @@ class FloatingMonitorApp:
             self.client.clear_client_usage_cache()
             self.refresh_async()
             return
+        if btn in {"rank_today", "rank_5h", "rank_7d", "rank_cycle"}:
+            self._account_range = {
+                "rank_today": "today",
+                "rank_5h": "5h",
+                "rank_7d": "7d",
+                "rank_cycle": "cycle",
+            }[btn]
+            self._account_range_user_selected = True
+            self._draw()
+            return
         if self._hit_resize_handle(event.x, event.y):
             self._resizing = True
             self._resize_data = {"x": event.x_root, "y": event.y_root, "w": self.WIDTH, "h": self.HEIGHT}
@@ -1658,6 +2101,22 @@ class FloatingMonitorApp:
     #  DATA REFRESH
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+    def _maybe_select_cycle_range(self, state: MonitorState) -> None:
+        if self._account_range_user_selected or self._account_range_auto_selected:
+            return
+        if self._account_range != "today":
+            return
+        latest = str(state.latest_account_name or "").replace("LOCAL - ", "")
+        for account in state.top_accounts or []:
+            window = account.get("window_cycle") if isinstance(account, dict) else None
+            if not isinstance(window, dict) or not window.get("quota_available"):
+                continue
+            name = str(account.get("name") or "")
+            if latest and (name in latest or latest in name):
+                self._account_range = "cycle"
+                self._account_range_auto_selected = True
+                return
+
     def refresh_async(self) -> None:
         if not self._refresh_lock.acquire(blocking=False):
             return
@@ -1690,6 +2149,7 @@ class FloatingMonitorApp:
             except Exception:
                 result.cost_history = summarize_usage_history(load_usage_history())
             self.state = result
+            self._maybe_select_cycle_range(result)
         self._ensure_topmost()
         self._schedule_topmost_repair()
         self._draw()

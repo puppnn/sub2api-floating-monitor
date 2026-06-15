@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 .env
+client_usage_config.json
+client_usage_speed_history.json
 client_usage_today.json
 usage_history.json
 .venv/

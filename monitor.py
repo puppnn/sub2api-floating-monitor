@@ -403,10 +403,12 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
         source_date = str(state.client_usage.get("date") or "").strip()
     existing_source_date = str(existing.get("source_date") or "").strip()
 
-    # Same-day usage is cumulative. A sharp drop usually means a transient
-    # exporter/API failure or a source switch, so keep the higher observed
-    # counters instead of letting a partial refresh erase the day.
-    if existing_source_date in {"", source_date, key}:
+    # Same-day local usage is reconstructed from client logs, so a temporary
+    # scan failure can make a later snapshot smaller. Sub2API/both mode is
+    # rebuilt from server totals plus filtered local direct usage, so it is
+    # allowed to correct an older polluted high-water value.
+    use_local_high_water = state.usage_source in {"local", "client", "local-codex"}
+    if use_local_high_water and existing_source_date in {"", source_date, key}:
         if existing_tokens > new_tokens and existing_tokens >= max(1, int(new_tokens * 1.05)):
             new_tokens = existing_tokens
             new_requests = max(new_requests, existing_requests)

@@ -1580,66 +1580,66 @@ class Sub2APIClient:
 
 
 class Theme:
-    """Cadence-inspired graphite and electric-blue palette."""
+    """Neutral charcoal palette with restrained periwinkle-blue data accents."""
     # ── base surfaces ──
-    bg_dark = "#17181B"
-    bg_card = "#202124"
-    bg_section = "#292A2F"
-    bg_lift = "#303238"
-    bg_hover = "#35373E"
+    bg_dark = "#18181B"
+    bg_card = "#202023"
+    bg_section = "#26262B"
+    bg_lift = "#2B2B31"
+    bg_hover = "#39393F"
 
     # ── primary blue ramp ──
-    amber_dim = "#365DAA"
-    amber = "#5B8DEF"
-    amber_bright = "#F7F8FA"
-    amber_glow = "#8CB1F7"
+    amber_dim = "#405F98"
+    amber = "#6E9DF8"
+    amber_bright = "#F4F4F6"
+    amber_glow = "#97B8F8"
 
     # ── secondary accents ──
-    cyan = "#79A7FF"
-    cyan_dim = "#3F4654"
-    violet = "#A7BFF5"
-    blue = "#4778DD"
+    cyan = "#8DB2F8"
+    cyan_dim = "#44444B"
+    violet = "#B5C8F5"
+    blue = "#4E7FE4"
 
     # ── text ──
-    text_primary = "#F7F8FA"
-    text_secondary = "#B2B4BC"
-    text_muted = "#7F828C"
+    text_primary = "#F5F5F7"
+    text_secondary = "#B8B8BF"
+    text_muted = "#888891"
 
     # ── semantic ──
-    accent_cyan = "#79A7FF"
+    accent_cyan = "#8DB2F8"
     accent_red = "#F06A6A"
     accent_green = "#68C995"
     quota_red_bg = "#412B30"
     quota_amber_bg = "#413829"
     quota_green_bg = "#263A34"
-    ag_bg = "#292A2F"
-    ag_surface = "#26272B"
-    ag_surface_hover = "#32343A"
-    ag_border = "#383A42"
-    ag_divider = "#313239"
-    ag_accent = "#5B8DEF"
-    ag_bar = "#79A7FF"
+    ag_bg = "#29292E"
+    ag_surface = "#27272C"
+    ag_surface_hover = "#39393F"
+    ag_border = "#35353B"
+    ag_divider = "#303035"
+    ag_accent = "#6E9DF8"
+    ag_bar = "#87ACF5"
     ag_success = "#68C995"
     ag_warn = "#E2B45B"
     ag_crit = "#F06A6A"
-    ag_muted = "#8D9099"
-    ag_input = "#8CB1F7"
-    ag_cache = "#6F9CF2"
-    ag_output = "#4778DD"
-    ag_reason = "#A8C3F7"
+    ag_muted = "#92929B"
+    ag_input = "#91B4F8"
+    ag_cache = "#6E9DF8"
+    ag_output = "#4E7FE4"
+    ag_reason = "#BBCDF8"
 
     # ── misc ──
-    border = "#34363D"
-    shadow = "#101114"
+    border = "#34343A"
+    shadow = "#0E0E10"
     transparent = "#010203"
 
     # ── fonts (family, size, weight) ──
-    font_title = ("Georgia", 19, "bold")
+    font_title = ("Segoe UI", 18, "bold")
     font_section = ("Segoe UI", 11, "bold")
     font_label = ("Segoe UI", 10, "normal")
     font_label_bold = ("Segoe UI", 10, "bold")
-    font_value = ("Georgia", 18, "bold")
-    font_value_sm = ("Georgia", 14, "bold")
+    font_value = ("Segoe UI", 18, "bold")
+    font_value_sm = ("Segoe UI", 14, "bold")
     font_tiny = ("Segoe UI", 9, "normal")
     font_micro = ("Segoe UI", 8, "normal")
     font_icon = ("Segoe UI", 13, "normal")
@@ -1911,15 +1911,12 @@ class FloatingMonitorApp:
             self._btn_rects[button_name] = (x1, y, x2, y + tab_h)
             selected = self._main_tab == value
             hovered = self._hover_btn == button_name
-            fill = Theme.ag_surface if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
-            outline = Theme.ag_accent if selected else Theme.ag_border
+            fill = Theme.bg_hover if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
+            outline = Theme.bg_hover if selected else Theme.ag_border
             text_color = Theme.text_primary if selected else (Theme.text_primary if hovered else Theme.ag_muted)
             self._draw_rounded_rect(x1, y, x2, y + tab_h, r=7, fill=fill, outline=outline, width=1)
             self.canvas.create_text((x1 + x2) // 2, y + 12, anchor="center", text=label,
                                     font=self._fonts["font_label_bold"], fill=text_color)
-            if selected:
-                self.canvas.create_line(x1 + 8, y + tab_h - 2, x2 - 8, y + tab_h - 2,
-                                        fill=Theme.ag_accent, width=2)
         return y + tab_h + 10
 
     def _draw_ag_section(self, col_l: int, col_r: int, y: int, title: str, badge: str = "") -> int:
@@ -1979,16 +1976,16 @@ class FloatingMonitorApp:
     @staticmethod
     def _activity_color(intensity: float) -> str:
         if intensity <= 0:
-            return "#2D2E33"
+            return "#2D2D32"
         if intensity < 0.18:
-            return "#34466B"
+            return "#3D4C6B"
         if intensity < 0.38:
-            return "#486BAE"
+            return "#5276B7"
         if intensity < 0.68:
-            return "#648FDF"
+            return "#6E9DF8"
         if intensity < 0.9:
-            return "#82A8F0"
-        return "#2F68DF"
+            return "#91B4F8"
+        return "#3975E5"
 
     def _trend_token_color(self, intensity: float, is_today: bool = False) -> str:
         if is_today:
@@ -2356,7 +2353,7 @@ class FloatingMonitorApp:
         c.create_text(col_l, legend_y + 1, anchor="nw", text="Less",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         legend_x = col_l + 30
-        for idx, color in enumerate(["#2D2E33", "#34466B", "#486BAE", "#648FDF", "#2F68DF"]):
+        for idx, color in enumerate(["#2D2D32", "#3D4C6B", "#5276B7", "#6E9DF8", "#3975E5"]):
             self._draw_rounded_rect(legend_x + idx * 14, legend_y, legend_x + idx * 14 + 10, legend_y + 10,
                                     r=2, fill=color, outline=Theme.ag_border)
         c.create_text(legend_x + 74, legend_y + 1, anchor="nw", text="More",
@@ -2553,9 +2550,9 @@ class FloatingMonitorApp:
             name = f"usage_range_{value}"
             selected = self._usage_range == value
             self._btn_rects[name] = (x - 3, y - 4, x + btn_w + 3, y + 24)
-            fill = Theme.ag_accent if selected else Theme.ag_surface
-            outline = Theme.ag_accent if selected else Theme.ag_border
-            text_color = "#FFFFFF" if selected else Theme.ag_muted
+            fill = Theme.bg_hover if selected else Theme.ag_surface
+            outline = Theme.bg_hover if selected else Theme.ag_border
+            text_color = Theme.text_primary if selected else Theme.ag_muted
             self._draw_rounded_rect(x, y - 1, x + btn_w, y + 21, r=6, fill=fill, outline=outline)
             c.create_text(x + btn_w // 2, y + 10, anchor="center", text=label,
                           font=self._fonts["font_micro"], fill=text_color)
@@ -3068,9 +3065,9 @@ class FloatingMonitorApp:
             self._btn_rects[button_name] = (x1, y - 1, x2, y - 1 + tab_h)
             selected = self._account_range == value
             hovered = self._hover_btn == button_name
-            fill = Theme.ag_accent if selected else (Theme.ag_surface_hover if hovered else Theme.ag_surface)
-            outline = Theme.ag_accent if selected else Theme.ag_border
-            text_color = "#FFFFFF" if selected else (Theme.text_primary if hovered else Theme.ag_muted)
+            fill = Theme.bg_hover if selected else (Theme.ag_surface_hover if hovered else Theme.ag_surface)
+            outline = Theme.bg_hover if selected else Theme.ag_border
+            text_color = Theme.text_primary if selected else (Theme.text_primary if hovered else Theme.ag_muted)
             self._draw_rounded_rect(x1, y - 1, x2, y - 1 + tab_h, r=6, fill=fill, outline=outline, width=1)
             c.create_text((x1 + x2) // 2, y + 9, anchor="center", text=label,
                           font=self._fonts["font_micro"], fill=text_color)

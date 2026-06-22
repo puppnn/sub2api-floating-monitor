@@ -2322,11 +2322,11 @@ def build_codex_window_stats(
         )
 
     (
-        aligned_5h,
-        aligned_7d,
+        _aligned_5h,
+        _aligned_7d,
         aligned_cycle,
-        aligned_starts_5h,
-        aligned_starts_7d,
+        _aligned_starts_5h,
+        _aligned_starts_7d,
         aligned_starts_cycle,
         direct_latest,
     ) = scan_cockpit_codex_quota_windows(
@@ -2335,11 +2335,7 @@ def build_codex_window_stats(
         now,
         window_end,
     )
-    aligned_starts = (
-        list(aligned_starts_5h.values())
-        + list(aligned_starts_7d.values())
-        + list(aligned_starts_cycle.values())
-    )
+    aligned_starts = list(aligned_starts_cycle.values())
     if aligned_starts:
         aligned_scan_start = min(aligned_starts)
         aligned_events = scan_all_codex_events(home, sessions_root, aligned_scan_start, window_end)
@@ -2362,14 +2358,8 @@ def build_codex_window_stats(
                 if direct_cutoff is not None and event.when <= direct_cutoff:
                     continue
                 multiplier = cost_multiplier_by_label.get(label, 1.0)
-                if label in aligned_starts_5h and event.when >= aligned_starts_5h[label]:
-                    add_codex_event_to_bucket(aligned_5h[label], event, multiplier)
-                if label in aligned_starts_7d and event.when >= aligned_starts_7d[label]:
-                    add_codex_event_to_bucket(aligned_7d[label], event, multiplier)
                 if label in aligned_starts_cycle and event.when >= aligned_starts_cycle[label]:
                     add_codex_event_to_bucket(aligned_cycle[label], event, multiplier)
-    buckets_5h.update(aligned_5h)
-    buckets_7d.update(aligned_7d)
     buckets_cycle = aligned_cycle
 
     result: dict[str, dict[str, dict[str, Any]]] = {}
@@ -2383,12 +2373,12 @@ def build_codex_window_stats(
     for label in labels:
         window_5h = bucket_to_window_dict(
             buckets_5h.get(label, UsageBucket()),
-            aligned_starts_5h.get(label, window_5h_start),
+            window_5h_start,
             now,
         )
         window_7d = bucket_to_window_dict(
             buckets_7d.get(label, UsageBucket()),
-            aligned_starts_7d.get(label, window_7d_start),
+            window_7d_start,
             now,
         )
         window_cycle = bucket_to_window_dict(

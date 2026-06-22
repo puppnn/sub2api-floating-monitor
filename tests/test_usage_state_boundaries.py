@@ -1,8 +1,9 @@
 import json
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import client_usage_export
 import monitor
@@ -151,6 +152,83 @@ class LocalExportHighWaterTests(unittest.TestCase):
 
         self.assertEqual(current["today"]["tokens"], 100_000)
         self.assertEqual(current["providers"][0]["window_7d"]["tokens"], 200_000)
+
+
+class WindowSemanticsTests(unittest.TestCase):
+    def test_rolling_usage_is_not_replaced_by_quota_cycle_usage(self) -> None:
+        now = datetime(2026, 6, 22, 12, 0, 0)
+        label = "Codex local - account@example.com"
+        rolling_5h = client_usage_export.UsageBucket(
+            requests=8,
+            input_tokens=5_000_000,
+            cost=5.0,
+        )
+        rolling_7d = client_usage_export.UsageBucket(
+            requests=70,
+            input_tokens=66_000_000,
+            cost=62.0,
+        )
+        quota_cycle_5h = client_usage_export.UsageBucket(
+            requests=4,
+            input_tokens=2_000_000,
+            cost=2.0,
+        )
+        quota_cycle_7d = client_usage_export.UsageBucket(
+            requests=40,
+            input_tokens=40_000_000,
+            cost=38.0,
+        )
+        quota = {
+            label: {
+                "window_5h": {
+                    "quota_available": True,
+                    "remaining_percent": 10.0,
+                    "utilization": 90.0,
+                    "resets_at": "2026-06-22T14:00:00+08:00",
+                },
+                "window_7d": {
+                    "quota_available": True,
+                    "remaining_percent": 17.0,
+                    "utilization": 83.0,
+                    "resets_at": "2026-06-25T15:00:00+08:00",
+                },
+            }
+        }
+
+        def scan_accounts(_home: Path, start: datetime, _end: datetime):
+            return {label: rolling_7d if now - start > timedelta(days=1) else rolling_5h}
+
+        aligned = (
+            {label: quota_cycle_5h},
+            {label: quota_cycle_7d},
+            {},
+            {label: now - timedelta(hours=2)},
+            {label: now - timedelta(days=4)},
+            {},
+            {},
+        )
+        with (
+            patch.object(client_usage_export, "cockpit_codex_quota_by_label", return_value=quota),
+            patch.object(client_usage_export, "cockpit_codex_speed_by_label", return_value={}),
+            patch.object(client_usage_export, "scan_cockpit_codex_accounts", side_effect=scan_accounts),
+            patch.object(client_usage_export, "scan_cockpit_codex_quota_windows", return_value=aligned),
+            patch.object(client_usage_export, "all_cockpit_codex_account_labels", return_value=[label]),
+        ):
+            result = client_usage_export.build_codex_window_stats(
+                Path("."),
+                Path("."),
+                now,
+                {},
+                label,
+            )
+
+        window_5h = result[label]["window_5h"]
+        window_7d = result[label]["window_7d"]
+        self.assertEqual(window_5h["tokens"], 5_000_000)
+        self.assertEqual(window_5h["utilization"], 90.0)
+        self.assertEqual(window_7d["tokens"], 66_000_000)
+        self.assertEqual(window_7d["utilization"], 83.0)
+        self.assertTrue(window_7d["start_at"].startswith("2026-06-15T12:00:00"))
 
 
 if __name__ == "__main__":

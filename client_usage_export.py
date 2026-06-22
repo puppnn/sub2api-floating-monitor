@@ -2138,31 +2138,6 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             if key in previous:
                 current[key] = previous[key]
 
-    def window_score(window: Any) -> tuple[int, int, float, int]:
-        if not isinstance(window, dict):
-            return (0, 0, 0.0, 0)
-        quota_flag = 1 if window.get("quota_available") else 0
-        return (
-            int(window.get("tokens") or 0),
-            int(window.get("requests") or 0),
-            float(window.get("cost") or 0),
-            quota_flag,
-        )
-
-    def merge_window_high_water(current: dict[str, Any], previous: dict[str, Any]) -> None:
-        for key in ("window_5h", "window_7d", "window_cycle"):
-            previous_window = previous.get(key)
-            if not isinstance(previous_window, dict):
-                continue
-            current_window = current.get(key)
-            if not isinstance(current_window, dict):
-                current[key] = previous_window
-                continue
-            previous_score = window_score(previous_window)
-            current_score = window_score(current_window)
-            if previous_score > current_score:
-                current[key] = previous_window
-
     def latest_time(row: Any) -> datetime | None:
         if not isinstance(row, dict):
             return None
@@ -2231,10 +2206,16 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             continue
         current = current_by_name.get(name)
         if current is None:
-            current_providers.append(previous)
-            current_by_name[name] = previous
+            recovered = dict(previous)
+            for window_key in ("window_5h", "window_7d", "window_cycle"):
+                window = recovered.get(window_key)
+                if isinstance(window, dict):
+                    window = dict(window)
+                    window["quota_stale"] = True
+                    recovered[window_key] = window
+            current_providers.append(recovered)
+            current_by_name[name] = recovered
             continue
-        merge_window_high_water(current, previous)
         merge_cumulative(current, previous)
 
     provider_totals = [provider for provider in current_providers if isinstance(provider, dict)]

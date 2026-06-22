@@ -122,15 +122,22 @@ class LocalExportHighWaterTests(unittest.TestCase):
             },
         }
 
-    def test_same_day_switch_preserves_totals_quota_and_activity(self) -> None:
+    def test_same_day_switch_preserves_totals_but_uses_current_quota(self) -> None:
         previous = self.snapshot(self.day, 1_000_000)
         current = self.snapshot(self.day, 100_000)
+        previous["providers"][0]["window_7d"].update(
+            {"remaining_percent": 31.0, "utilization": 69.0}
+        )
+        current["providers"][0]["window_7d"].update(
+            {"remaining_percent": 17.0, "utilization": 83.0}
+        )
         self.output_path.write_text(json.dumps(previous), encoding="utf-8")
 
         client_usage_export.same_day_output_high_water(current, self.output_path, self.day)
 
         self.assertEqual(current["today"]["tokens"], 1_000_000)
-        self.assertEqual(current["providers"][0]["window_7d"]["tokens"], 2_000_000)
+        self.assertEqual(current["providers"][0]["window_7d"]["tokens"], 200_000)
+        self.assertEqual(current["providers"][0]["window_7d"]["utilization"], 83.0)
         self.assertEqual(current["dashboard"]["hourly_today"][0]["tokens"], 1_000_000)
         self.assertEqual(current["latest_request"]["model"], "gpt-test")
 

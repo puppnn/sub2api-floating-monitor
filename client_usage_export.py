@@ -847,16 +847,46 @@ def dedupe_usage_events(events: list[UsageEvent]) -> list[UsageEvent]:
 
 
 def codex_event_id(event: UsageEvent) -> str:
-    time_key = event.request_at or event.when
     parts = [
         (event.session_id or event.request_key or "").strip(),
-        str(int(time_key.replace(tzinfo=LOCAL_TZ).timestamp() * 1000)),
+        str(int(event.when.replace(tzinfo=LOCAL_TZ).timestamp() * 1000)),
         event.model,
         str(event.input_tokens),
         str(event.cached_tokens),
         str(event.output_tokens),
     ]
     return "|".join(parts)
+
+
+def legacy_codex_event_id(event: UsageEvent) -> str:
+    if event.request_at is None:
+        return codex_event_id(event)
+    parts = [
+        (event.session_id or event.request_key or "").strip(),
+        str(int(event.request_at.replace(tzinfo=LOCAL_TZ).timestamp() * 1000)),
+        event.model,
+        str(event.input_tokens),
+        str(event.cached_tokens),
+        str(event.output_tokens),
+    ]
+    return "|".join(parts)
+
+
+def ledger_label_for_event(
+    event: UsageEvent,
+    ledger: dict[str, str] | None,
+) -> tuple[str, str]:
+    stable_id = codex_event_id(event)
+    if ledger is None:
+        return "", stable_id
+    label = ledger.get(stable_id, "")
+    if label:
+        return label, stable_id
+    legacy_id = legacy_codex_event_id(event)
+    label = ledger.get(legacy_id, "")
+    if label and stable_id:
+        ledger[stable_id] = label
+    return label, stable_id
 
 
 def usage_event_attribution_time(event: UsageEvent) -> datetime:
@@ -1934,8 +1964,7 @@ def attribute_codex_events_by_account(
         return attributed
     if not markers:
         for event in events:
-            event_id = codex_event_id(event)
-            label = attribution_ledger.get(event_id, "") if attribution_ledger is not None else ""
+            label, event_id = ledger_label_for_event(event, attribution_ledger)
             if not label:
                 label = UNASSIGNED_CODEX_LABEL
                 if (
@@ -1956,8 +1985,7 @@ def attribute_codex_events_by_account(
     request_times = [marker.when for marker in request_markers]
     ledger = attribution_ledger
     for event in events:
-        event_id = codex_event_id(event)
-        label = ledger.get(event_id, "") if ledger is not None else ""
+        label, event_id = ledger_label_for_event(event, ledger)
         if not label:
             label = account_label_at_time(event, switch_markers, switch_times, request_markers, request_times)
             if (

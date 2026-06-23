@@ -231,5 +231,56 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertTrue(window_7d["start_at"].startswith("2026-06-15T12:00:00"))
 
 
+class AttributionLedgerTests(unittest.TestCase):
+    def test_stable_event_id_wins_when_route_time_changes(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 6, 23, 16, 49, 45),
+            request_at=datetime(2026, 6, 23, 16, 2, 46),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=200,
+            output_tokens=10,
+            session_id="session-1",
+        )
+        stable_id = client_usage_export.codex_event_id(event)
+        legacy_id = client_usage_export.legacy_codex_event_id(event)
+        ledger = {
+            stable_id: "Codex local - new-account@example.com",
+            legacy_id: "Codex local - old-account@example.com",
+        }
+
+        attributed = client_usage_export.attribute_codex_events_by_account(
+            [event],
+            [],
+            ledger,
+        )
+
+        self.assertIn("Codex local - new-account@example.com", attributed)
+        self.assertNotIn("Codex local - old-account@example.com", attributed)
+
+    def test_legacy_event_id_is_migrated_without_losing_attribution(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 6, 23, 16, 49, 45),
+            request_at=datetime(2026, 6, 23, 16, 2, 46),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=200,
+            output_tokens=10,
+            session_id="session-1",
+        )
+        stable_id = client_usage_export.codex_event_id(event)
+        legacy_id = client_usage_export.legacy_codex_event_id(event)
+        ledger = {legacy_id: "Codex local - account@example.com"}
+
+        attributed = client_usage_export.attribute_codex_events_by_account(
+            [event],
+            [],
+            ledger,
+        )
+
+        self.assertIn("Codex local - account@example.com", attributed)
+        self.assertEqual(ledger[stable_id], "Codex local - account@example.com")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-# Codex Token Pulse
+# Token Floating Monitor
 
 一个轻量级 Windows Token 悬浮窗，用 Python/Tk 写成，不需要额外 Python 依赖。它可以在桌面上显示当前活跃账号、并发、今日请求量、Token、成本、账号额度窗口，以及更细的用量统计面板。
 

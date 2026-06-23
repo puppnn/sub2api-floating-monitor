@@ -1687,7 +1687,7 @@ class FloatingMonitorApp:
 
         # ── root window ──
         self.root = tk.Tk()
-        self.root.title("Codex Token Pulse")
+        self.root.title("Token Monitor")
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}+1120+70")
         self.root.attributes("-topmost", True)
@@ -2766,7 +2766,7 @@ class FloatingMonitorApp:
         #  HEADER  (row y=10..48)
         # ════════════════════════════════════════════════════════
         y = 16
-        title_text = "Codex Token Pulse"
+        title_text = "Token Pulse"
         c.create_text(COL_L, y, anchor="nw", text=title_text,
                        font=self._fonts["font_title"], fill=Theme.amber_bright)
 
